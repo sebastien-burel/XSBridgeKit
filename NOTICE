@@ -1,0 +1,32 @@
+XSBridgeKit — third-party notices
+==================================
+
+1. Original project code — MIT License (see LICENSE)
+---------------------------------------------------
+Copyright (c) 2026 Sébastien Burel.
+
+Everything tracked in this repository is original work, licensed under the MIT
+License — the bridge shim, the Swift API, the test harness and the build setup:
+
+    Sources/XSBridge/bridge.c
+    Sources/XSBridge/include/
+    Sources/XSBridgeKit/
+    Sources/xsBridgeTest/
+    agents/
+    scripts/
+
+2. Moddable SDK (XS engine) — GNU LGPL v3
+-----------------------------------------
+This package compiles the XS JavaScript engine from the Moddable SDK, but does
+**not** redistribute any Moddable source. The sources are linked at build time
+from a local Moddable checkout you provide (via $MODDABLE and
+scripts/link-moddable.sh — see README); the links under Sources/XSBridge/xs/ are
+git-ignored and never committed.
+
+    Project : Moddable SDK
+    Source  : https://github.com/Moddable-OpenSource/moddable
+    License : GNU LGPL v3 — https://www.gnu.org/licenses/lgpl-3.0.html
+
+The Moddable sources are used verbatim, unmodified; this package only selects a
+subset of them and supplies the compile flags (Package.swift). The XS engine
+remains the property of Moddable Tech, Inc. and is governed by the LGPL v3.

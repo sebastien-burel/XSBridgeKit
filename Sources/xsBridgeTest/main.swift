@@ -1,0 +1,316 @@
+// xsBridgeTest — phase runner / test harness.
+// Runs each phase's criteria, prints "PHASE n: PASS|FAIL", and exits non-zero
+// if any criterion fails (usable in CI / non-interactive runs — PLAN annex).
+
+import XSBridge      // C module — for xsb_smoke() in Phase 0
+import XSBridgeKit   // Swift API — XSEngine
+import Darwin
+import Foundation
+
+var failures = 0
+
+func check(_ label: String, _ condition: Bool) {
+    print("  [\(condition ? "ok" : "XX")] \(label)")
+    if !condition { failures += 1 }
+}
+
+func phaseResult(_ n: Int, _ before: Int) {
+    let ok = failures == before
+    print("PHASE \(n): \(ok ? "PASS" : "FAIL")")
+}
+
+/// Current resident memory in bytes — used to eyeball leaks across the stress loop.
+func residentBytes() -> UInt64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? info.resident_size : 0
+}
+
+// ---- Phase 0: smoke ----
+do {
+    let before = failures
+    print("PHASE 0 — smoke")
+    check("xsb_smoke() == 42", xsb_smoke() == 42)
+    phaseResult(0, before)
+}
+
+// ---- Phase 1: machine lifecycle + synchronous eval ----
+do {
+    let before = failures
+    print("PHASE 1 — machine lifecycle + sync eval")
+
+    guard let engine = XSEngine(host: DemoHost()) else {
+        check("create machine", false)
+        phaseResult(1, before)
+        exit(1)
+    }
+
+    // eval returns a value
+    if let r = try? engine.eval("6 * 7") {
+        check("eval(\"6 * 7\") == 42", r == "42")
+    } else {
+        check("eval(\"6 * 7\") == 42", false)
+    }
+
+    // eval throwing is caught and returned as an error — process survives
+    do {
+        _ = try engine.eval("throw new Error('boom')")
+        check("eval(throw) reported as error", false)
+    } catch let e as XSError {
+        check("eval(throw) reported as error (\(e.message))", e.message.range(of: "boom") != nil)
+    } catch {
+        check("eval(throw) reported as error", false)
+    }
+
+    // process is still alive and the same machine still works after the throw
+    check("machine usable after exception", (try? engine.eval("1 + 1")) == "2")
+
+    // N create/delete cycles — no crash, no leak.
+    // Count overridable via XSB_MACHINE_ITERS (used by the Phase 5 stress test).
+    let iters = ProcessInfo.processInfo.environment["XSB_MACHINE_ITERS"].flatMap { Int($0) } ?? 1000
+
+    func cycle() -> Bool {
+        guard let e = XSEngine(host: DemoHost()) else { return false }
+        return (try? e.eval("({a:1,b:2})")) != nil
+        // e released here -> xsb_delete_machine
+    }
+
+    // Warm up so the one-time high-water marks are established before measuring:
+    // the allocator's mapped regions (one machine ≈ 16 MB chunk + slot heap) AND
+    // the pthread stack cache (each engine runs on its own 4 MB-stack thread, A3).
+    // The leak test is then growth ACROSS the loop, which must stay bounded — a
+    // true per-machine leak would scale with `iters` (hundreds of MB over 1000).
+    for _ in 0..<50 { _ = cycle() }
+
+    // Steady-state RSS. libmalloc keeps freed large allocations (a machine's
+    // 16 MB chunk) in a per-zone cache for reuse, so a naive sample can show a
+    // spurious one-time +16 MB that is cache, not a leak. Ask the allocator to
+    // return cached free memory to the OS first, so RSS reflects true usage.
+    func steadyRSS() -> UInt64 {
+        malloc_zone_pressure_relief(nil, 0)
+        return residentBytes()
+    }
+
+    let rssBefore = steadyRSS()
+    var loopOK = true
+    for _ in 0..<iters {
+        if !cycle() { loopOK = false; break }
+    }
+    let rssAfter = steadyRSS()
+    check("\(iters) machine create/eval/delete cycles", loopOK)
+    let mb: Double = 1_048_576
+    let growthMB: Double = (Double(rssAfter) - Double(rssBefore)) / mb
+    print(String(format: "  RSS across loop: %.1f MB -> %.1f MB (delta %+.1f MB)",
+                 Double(rssBefore) / mb, Double(rssAfter) / mb, growthMB))
+    // Coarse machine-level guard: RSS must not grow unboundedly. The ceiling is
+    // generous (< 30 MB) on purpose — each engine runs on its own thread (A3),
+    // so cycling 1000 of them leaves the OS holding a small *bounded* cache of
+    // freed 4 MB thread stacks (~16 MB observed, doesn't scale with `iters`,
+    // not flushable via malloc APIs). A genuine leak (machines/threads/slots not
+    // freed) would be GB-scale here. Exact slot-leak detection is the
+    // remember/forget balance asserted in Phases 3-5.
+    check("no unbounded machine leak (delta < 30 MB)", growthMB < 30)
+
+    phaseResult(1, before)
+}
+
+// ---- Phase 2: synchronous host function (JS -> Swift) ----
+do {
+    let before = failures
+    print("PHASE 2 — synchronous host function (JS -> Swift)")
+
+    let demo = DemoHost()
+    guard let engine = XSEngine(host: demo) else {
+        check("create machine", false)
+        phaseResult(2, before)
+        exit(1)
+    }
+
+    let result = try? engine.eval("host.add(2, 3)")
+    check("host.add(2, 3) == 5", result == "5")
+    check("Swift host call executed (count == 1)", demo.syncCallCount == 1)
+
+    phaseResult(2, before)
+}
+
+// ---- Phase 3: asynchronous bridge (THE critical phase) ----
+do {
+    let before = failures
+    print("PHASE 3 — async bridge (echo)")
+
+    // Test A: load agents/echo.js — `const r = await host.echo("hi"); print(r)`.
+    if let engine = XSEngine(host: DemoHost()) {
+        let path = "agents/echo.js"
+        if let src = try? String(contentsOfFile: path, encoding: .utf8) {
+            _ = try? engine.eval(src)
+            check("echo kicked off one async call", engine.pendingCount == 1)
+            engine.runUntilIdle()
+            check("echo.js printed \"hi\"", engine.outputs == ["hi"])
+            check("all async calls settled", engine.pendingCount == 0)
+        } else {
+            check("read \(path)", false)
+        }
+    } else {
+        check("create machine", false)
+    }
+
+    // Test B: 100 sequential echoes — all correct, no leak.
+    if let engine = XSEngine(host: DemoHost()) {
+        let n = 100
+        let agent = """
+        (async () => {
+          for (let i = 0; i < \(n); i++) {
+            const r = await host.echo("n" + i);
+            print(r);
+          }
+        })();
+        """
+        _ = try? engine.eval(agent)
+        engine.runUntilIdle(timeout: 30)
+
+        let out = engine.outputs
+        check("\(n) sequential echoes all printed", out.count == n)
+        let allCorrect = out.enumerated().allSatisfy { $0.element == "n\($0.offset)" }
+        check("\(n) echoes all correct and in order", allCorrect)
+        check("id table empty at end", engine.pendingCount == 0)
+        let (remembered, forgotten) = engine.rememberForgetCounts
+        check("remember/forget balanced (\(remembered) == \(forgotten))", remembered == forgotten)
+        check("rooted exactly 2 slots per call (\(remembered) == \(2 * n))", remembered == UInt32(2 * n))
+    } else {
+        check("create machine", false)
+    }
+
+    phaseResult(3, before)
+}
+
+// ---- Phase 4: streaming via reverse channel ----
+do {
+    let before = failures
+    print("PHASE 4 — streaming (reverse channel)")
+
+    if let engine = XSEngine(host: DemoHost()) {
+        let path = "agents/stream.js"
+        if let src = try? String(contentsOfFile: path, encoding: .utf8) {
+            _ = try? engine.eval(src)
+            let start = Date()
+            engine.runUntilIdle()
+            let elapsed = Date().timeIntervalSince(start)
+
+            let out = engine.outputs
+            let expected = ["delta:Hello", "delta: ", "delta:from", "delta: ",
+                            "delta:Swift", "full:Hello from Swift"]
+            check("5 deltas then final, in order", out == expected)
+            let deltas = out.filter { $0.hasPrefix("delta:") }
+            check("received 5 deltas", deltas.count == 5)
+            // Tokens are 50 ms apart: a single block would finish near-instantly.
+            check("tokens arrived incrementally (elapsed \(String(format: "%.2f", elapsed))s ≥ 0.2s)",
+                  elapsed >= 0.2)
+            check("all settled", engine.pendingCount == 0)
+            let (remembered, forgotten) = engine.rememberForgetCounts
+            check("remember/forget balanced (\(remembered) == \(forgotten))", remembered == forgotten)
+            check("rooted 3 slots (resolve+reject+onToken) (\(remembered) == 3)", remembered == 3)
+        } else {
+            check("read \(path)", false)
+        }
+    } else {
+        check("create machine", false)
+    }
+
+    phaseResult(4, before)
+}
+
+// ---- Phase 5: concurrency & robustness ----
+do {
+    let before = failures
+    print("PHASE 5 — concurrency & robustness")
+
+    func loadAgent(_ name: String) -> String? {
+        try? String(contentsOfFile: "agents/\(name)", encoding: .utf8)
+    }
+
+    func balanced(_ engine: XSEngine) -> Bool {
+        let (r, f) = engine.rememberForgetCounts
+        return r == f && engine.pendingCount == 0
+    }
+
+    // Concurrent: Promise.all of several in-flight echoes, no id crosstalk.
+    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("concurrent.js") {
+        _ = try? engine.eval(src)
+        engine.runUntilIdle()
+        check("concurrent Promise.all preserves results", engine.outputs == ["all:a,b,c,d"])
+        check("concurrent: roots balanced, table empty", balanced(engine))
+    } else {
+        check("concurrent.js", false)
+    }
+
+    // Reject path: host.fail() -> Swift reject -> JS catch, no escape to Swift.
+    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("error.js") {
+        _ = try? engine.eval(src)
+        engine.runUntilIdle()
+        check("reject surfaces in JS catch", engine.outputs == ["caught:deliberate failure"])
+        check("reject: roots balanced, table empty", balanced(engine))
+    } else {
+        check("error.js", false)
+    }
+
+    // Mixed sequential agent: echo then stream, distinct ids, no crosstalk.
+    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("sequential.js") {
+        _ = try? engine.eval(src)
+        engine.runUntilIdle()
+        let expected = ["echo:first", "delta:Hello", "delta: ", "delta:from",
+                        "delta: ", "delta:Swift", "stream:Hello from Swift"]
+        check("mixed echo+stream agent in order", engine.outputs == expected)
+        check("mixed: roots balanced, table empty", balanced(engine))
+    } else {
+        check("sequential.js", false)
+    }
+
+    // Stress: >= 5000 calls, batches in flight, forced GC between turns.
+    if let engine = XSEngine(host: DemoHost()) {
+        let batches = 100, perBatch = 50  // 5000 calls
+        let agent = """
+        (async () => {
+          let ok = 0, bad = 0;
+          for (let b = 0; b < \(batches); b++) {
+            const ps = [];
+            for (let i = 0; i < \(perBatch); i++) {
+              const v = "v" + b + "_" + i;
+              ps.push(host.echo(v).then(r => { r === v ? ok++ : bad++; }));
+            }
+            await Promise.all(ps);
+          }
+          print("stress ok:" + ok + " bad:" + bad);
+        })();
+        """
+        let rssBefore = residentBytes()
+        _ = try? engine.eval(agent)
+        engine.runUntilIdleForcingGC()
+        let rssAfter = residentBytes()
+
+        let total = batches * perBatch
+        check("stress: \(total) calls all correct, none mixed up",
+              engine.outputs == ["stress ok:\(total) bad:0"])
+        check("stress: id table empty", engine.pendingCount == 0)
+        let (remembered, forgotten) = engine.rememberForgetCounts
+        check("stress: remember/forget balanced (\(remembered) == \(forgotten))",
+              remembered == forgotten)
+        check("stress: rooted 2 per call (\(remembered) == \(2 * total))",
+              remembered == UInt32(2 * total))
+        let growthMB = (Double(rssAfter) - Double(rssBefore)) / 1_048_576
+        print(String(format: "  stress RSS: %.1f MB -> %.1f MB (delta %+.1f MB)",
+                     Double(rssBefore) / 1_048_576, Double(rssAfter) / 1_048_576, growthMB))
+        check("stress: memory stable (delta < 20 MB)", growthMB < 20)
+    } else {
+        check("create machine", false)
+    }
+
+    phaseResult(5, before)
+}
+
+exit(failures == 0 ? 0 : 1)

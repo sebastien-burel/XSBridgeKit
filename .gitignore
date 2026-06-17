@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+*.o
+DerivedData/
+.DS_Store
+.claude/
+
+# XS engine sources are not vendored — linked from $MODDABLE by
+# scripts/link-moddable.sh (see README). The links are local-only.
+/Sources/XSBridge/xs/
