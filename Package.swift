@@ -30,7 +30,10 @@ let package = Package(
         .target(
             name: "XSBridge",
             // xsum.c is #included by xsMath.c, not compiled standalone.
-            exclude: ["xs/sources/xsum.c"],
+            // xsffi.c implements the xsmc C API + mod syscall shims; nothing in
+            // this build references it (we use the classic xs.h API), so it is
+            // dead code — exclude it.
+            exclude: ["xs/sources/xsum.c", "xs/sources/xsffi.c"],
             cSettings: headerPaths + xsDefines,
             linkerSettings: [
                 .linkedFramework("CoreServices"),
