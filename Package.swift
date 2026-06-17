@@ -5,12 +5,11 @@ import PackageDescription
 // These MUST be identical across every translation unit in XSBridge: the
 // txMachine struct layout depends on them, so a mismatch is silent ABI corruption.
 let xsDefines: [CSetting] = [
-    .define("INCLUDE_XSPLATFORM"),
-    .define("XSPLATFORM", to: "\"xst.h\""),
-    .define("mxProfile", to: "1"),
-    .define("mxDebug", to: "1"),
-    .define("mxNoConsole", to: "1"),
-    .define("mxStringInfoCacheLength", to: "4"),
+  .define("XS_ARCHIVE", to: "1"),
+  .define("INCLUDE_XSPLATFORM", to: "1"),
+  .define("XSPLATFORM", to: "\"mac_xs.h\""),
+  .define("mxDebug", to: "1"),
+  .define("mxStringInfoCacheLength", to: "4"),
 ]
 
 let headerPaths: [CSetting] = [
@@ -18,7 +17,6 @@ let headerPaths: [CSetting] = [
     .headerSearchPath("xs/includes"),
     .headerSearchPath("xs/platforms"),
     .headerSearchPath("xs/tools"),
-    .headerSearchPath("xs/tools/fdlibm"),
 ]
 
 let package = Package(
@@ -32,7 +30,10 @@ let package = Package(
         .target(
             name: "XSBridge",
             // xsum.c is #included by xsMath.c, not compiled standalone.
-            exclude: ["xs/sources/xsum.c"],
+            // xsffi.c implements the xsmc C API + mod syscall shims; nothing in
+            // this build references it (we use the classic xs.h API), so it is
+            // dead code — exclude it.
+            exclude: ["xs/sources/xsum.c", "xs/sources/xsffi.c"],
             cSettings: headerPaths + xsDefines,
             linkerSettings: [
                 .linkedFramework("CoreServices"),

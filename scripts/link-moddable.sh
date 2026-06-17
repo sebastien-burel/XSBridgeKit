@@ -26,15 +26,19 @@ echo "Linking XS sources from: $SRC"
 rm -rf "$XS"
 mkdir -p "$XS/platforms" "$XS/tools"
 
-# Whole-directory links (compiled .c live only in sources/ and tools/fdlibm/).
+# Whole-directory links (compiled .c live only in sources/). fdlibm is not
+# linked: the macOS port uses the system libm (xsPlatform.h maps c_sin -> sin,
+# etc.); fdlibm is only for embedded ports that redefine those.
 ln -s "$SRC/sources"      "$XS/sources"
 ln -s "$SRC/includes"     "$XS/includes"
-ln -s "$SRC/tools/fdlibm" "$XS/tools/fdlibm"
 
 # Per-file links: these directories also hold sources we must NOT compile
 # (every other platform port, the xs* compilers, the YAML lib, test262, …).
-ln -s "$SRC/platforms/xsHost.h"    "$XS/platforms/xsHost.h"
+# The macOS platform port (mac_xs.c) is compiled; it provides the CFRunLoop
+# integration (worker-job queue + promise source) and the xsbug transport.
 ln -s "$SRC/platforms/xsPlatform.h" "$XS/platforms/xsPlatform.h"
-ln -s "$SRC/tools/xst.h"           "$XS/tools/xst.h"
+ln -s "$SRC/platforms/xsHost.h"     "$XS/platforms/xsHost.h"
+ln -s "$SRC/platforms/mac_xs.h"     "$XS/platforms/mac_xs.h"
+ln -s "$SRC/platforms/mac_xs.c"     "$XS/platforms/mac_xs.c"
 
 echo "Done. Now: swift build -c release"

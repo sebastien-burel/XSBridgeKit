@@ -1,12 +1,14 @@
 /*
  * bridge.c — the shim between Swift and the XS engine.
  *
- * Phases 0-2: smoke, machine lifecycle + sync eval, sync host function.
- * Phase 3: the asynchronous bridge. A JS Promise is created on the JS side;
- * __nativeCall roots its resolve/reject (xsRemember), dispatches the request to
- * Swift, and Swift settles it later from a background queue by signaling a
- * CFRunLoopSource. The perform callback (on the XS run loop) resolves/rejects,
- * xsForgets, and drains promise jobs to resume the awaiting JS continuation.
+ * The asynchronous bridge: a JS Promise is created on the JS side; __nativeCall
+ * roots its resolve/reject (fxRemember), dispatches the request to Swift, and
+ * Swift settles it later from a background queue by posting a worker job
+ * (fxQueueWorkerJob, from the macOS platform port mac_xs.c). The job callback,
+ * run on the XS thread, resolves/rejects, fxForgets, and drains promise jobs to
+ * resume the awaiting JS continuation. mac_xs.c owns the run-loop integration
+ * (worker-job queue + promise source); this file holds the host functions, the
+ * pending-call bookkeeping, and the settlement logic.
  *
  * Invariants: XS is single-threaded (all machine access on the run-loop thread);
  * no xsSlot crosses into Swift (only opaque ids + UTF-8 JSON); every Swift->XS
@@ -19,29 +21,17 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <CoreFoundation/CoreFoundation.h>
 
 /* ---------------------------------------------------------------------------
- * Platform layer (see Phase 1 notes): minimal standalone impls that xst.h
- * leaves to the host program.
+ * Platform layer. The macOS port (mac_xs.c) now provides the run-loop
+ * integration — fxCreateMachinePlatform / fxDeleteMachinePlatform, the
+ * cross-thread worker-job queue (fxQueueWorkerJob) and the promise run-loop
+ * source — and module loading (mxUseDefaultFindModule / mxUseDefaultLoadModule).
+ * The host program must still supply fxAbort, which mac_xs.c leaves out (it
+ * normally comes from xst.c, which we exclude). The shared-timer functions are
+ * not needed: mac_xs.h defines mxUseGCCAtomics, which compiles out the
+ * shared-timer paths in xsAtomics.c.
  * ------------------------------------------------------------------------- */
-
-void fxCreateMachinePlatform(txMachine* the)
-{
-#ifdef mxDebug
-  the->connection = mxNoSocket;
-#endif
-}
-
-void fxDeleteMachinePlatform(txMachine* the)
-{
-}
-
-void fxQueuePromiseJobs(txMachine* the)
-{
-    the->promiseJobs = 1;
-}
 
 void fxAbort(txMachine* the, int status)
 {
@@ -51,35 +41,6 @@ void fxAbort(txMachine* the, int status)
         return;
     the->exitStatus = status;
     fxExitToHost(the);
-}
-
-txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
-{
-    (void)the; (void)realm; (void)moduleID; (void)slot;
-    return XS_NO_ID;
-}
-
-void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
-{
-    (void)the; (void)module; (void)moduleID;
-}
-
-void fxInitializeSharedTimers(void) {}
-void fxTerminateSharedTimers(void) {}
-
-void* fxScheduleSharedTimer(double timeout, double interval,
-                            txSharedTimerCallback callback,
-                            void* refcon, int refconSize)
-{
-    (void)timeout; (void)interval; (void)callback; (void)refcon; (void)refconSize;
-    return NULL;
-}
-
-void fxUnscheduleSharedTimer(txSharedTimer* timer) { (void)timer; }
-
-void fxRescheduleSharedTimer(txSharedTimer* timer, double timeout, double interval)
-{
-    (void)timer; (void)timeout; (void)interval;
 }
 
 /* ---------------------------------------------------------------------------
@@ -102,26 +63,22 @@ typedef struct XSPending {
     struct XSPending* next;
 } XSPending;
 
-/* A message handed back from a Swift background thread to the XS thread:
- * a streamed token (XSB_TOKEN, keeps the call open) or the final settlement
- * (XSB_RESOLVE / XSB_REJECT). */
-typedef struct XSResult {
+/* A unit of work handed back from a Swift background thread to the XS thread via
+ * mac_xs.c's worker-job queue. The txWorkerJob header MUST be first: the queue
+ * links and c_free's the struct by that header. Carries a streamed token
+ * (XSB_TOKEN, keeps the call open) or the final settlement (XSB_RESOLVE/REJECT). */
+typedef struct XSBJob {
+    txWorkerJob job;    /* { next, callback } — must be first */
     uint32_t id;
     int type;
     char* json;         /* token delta / result value as JSON (owned) */
-    struct XSResult* next;
-} XSResult;
+} XSBJob;
 
 typedef struct XSBridge {
     xsMachine* machine;
     void* swiftContext;     /* opaque XSEngine pointer, for sync host.add */
     uint32_t nextId;
     XSPending* pending;    /* XS-thread only */
-
-    pthread_mutex_t lock;
-    XSResult* results;     /* guarded by lock; producer = bg threads */
-    CFRunLoopSourceRef source;
-    CFRunLoopRef runloop;
 
     uint32_t rememberCount; /* leak accounting */
     uint32_t forgetCount;
@@ -138,7 +95,7 @@ extern void xsb_dispatch(void* bridge, uint32_t id,
                          const char* key, const char* json);
 extern char* xsb_dispatch_sync(void* bridge, const char* key, const char* json);
 
-static void xsb_perform(void* info);
+static void xsb_job_perform(void* machine, void* job);
 
 /* ---------------------------------------------------------------------------
  * Host functions — generic primitives only. The consumer installs its host.*
@@ -277,75 +234,73 @@ static XSPending* xsb_find_pending(XSBridge* bridge, uint32_t id)
     return NULL;
 }
 
-static void xsb_perform(void* info)
+/* Drain the microtask (promise jobs) queue to quiescence, within a host frame.
+ * mac_xs.c's fxQueuePromiseJobs signals a run-loop source rather than setting a
+ * flag, so we drain explicitly here to guarantee that once a call's pending
+ * record is gone, its `await` continuation has already run (the harness treats
+ * pending_count == 0 as "fully settled"). Must be called inside xsBeginHost. */
+static void xsb_drain_promises(txMachine* the)
 {
-    XSBridge* bridge = (XSBridge*)info;
+    xsTry {
+        while (mxPendingJobs.value.reference->next)
+            fxRunPromiseJobs(the);
+    }
+    xsCatch {
+    }
+}
 
-    /* Detach the whole batch under the lock, then settle without holding it. */
-    pthread_mutex_lock(&bridge->lock);
-    XSResult* batch = bridge->results;
-    bridge->results = NULL;
-    pthread_mutex_unlock(&bridge->lock);
-    if (!batch)
-        return;
+/* Worker-job callback: mac_xs.c invokes it on the XS thread (unframed) for each
+ * job posted via fxQueueWorkerJob. Applies one streamed token or one final
+ * settlement, then drains promise jobs. */
+static void xsb_job_perform(void* machine, void* job_)
+{
+    XSBJob* j = (XSBJob*)job_;
+    XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
 
-    xsBeginHost(bridge->machine);
+    xsBeginHost((xsMachine*)machine);
     {
         xsVars(2);
-        XSResult* r = batch;
-        while (r) {
-            XSResult* next = r->next;
-            if (r->type == XSB_TOKEN) {
-                /* Reverse channel: invoke onToken(delta), keep the call open. */
-                XSPending* rec = xsb_find_pending(bridge, r->id);
-                if (rec && rec->hasOnToken) {
-                    xsTry {
-                        xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
-                        xsVar(1) = xsCall1(xsVar(0), xsID("parse"), xsString(r->json));
-                        xsCallFunction1(xsAccess(rec->onToken), xsUndefined, xsVar(1));
-                    }
-                    xsCatch {
-                    }
+        if (j->type == XSB_TOKEN) {
+            /* Reverse channel: invoke onToken(delta), keep the call open. */
+            XSPending* rec = xsb_find_pending(bridge, j->id);
+            if (rec && rec->hasOnToken) {
+                xsTry {
+                    xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
+                    xsVar(1) = xsCall1(xsVar(0), xsID("parse"), xsString(j->json));
+                    xsCallFunction1(xsAccess(rec->onToken), xsUndefined, xsVar(1));
                 }
-            } else {
-                /* Final settlement: resolve/reject, then forget all roots. */
-                XSPending* rec = xsb_unlink_pending(bridge, r->id);
-                if (rec) {
-                    xsTry {
-                        xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
-                        xsVar(1) = xsCall1(xsVar(0), xsID("parse"), xsString(r->json));
-                        if (r->type == XSB_RESOLVE)
-                            xsCallFunction1(xsAccess(rec->resolve), xsUndefined, xsVar(1));
-                        else
-                            xsCallFunction1(xsAccess(rec->reject), xsUndefined, xsVar(1));
-                    }
-                    xsCatch {
-                    }
-                    fxForget(the, &rec->resolve);
-                    fxForget(the, &rec->reject);
-                    bridge->forgetCount += 2;
-                    if (rec->hasOnToken) {
-                        fxForget(the, &rec->onToken);
-                        bridge->forgetCount += 1;
-                    }
-                    free(rec);
+                xsCatch {
                 }
             }
-            free(r->json);
-            free(r);
-            r = next;
-        }
-        /* Drain promise jobs so the `await` continuations resume. */
-        xsTry {
-            while (the->promiseJobs) {
-                the->promiseJobs = 0;
-                fxRunPromiseJobs(the);
+        } else {
+            /* Final settlement: resolve/reject, then forget all roots. */
+            XSPending* rec = xsb_unlink_pending(bridge, j->id);
+            if (rec) {
+                xsTry {
+                    xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
+                    xsVar(1) = xsCall1(xsVar(0), xsID("parse"), xsString(j->json));
+                    if (j->type == XSB_RESOLVE)
+                        xsCallFunction1(xsAccess(rec->resolve), xsUndefined, xsVar(1));
+                    else
+                        xsCallFunction1(xsAccess(rec->reject), xsUndefined, xsVar(1));
+                }
+                xsCatch {
+                }
+                fxForget(the, &rec->resolve);
+                fxForget(the, &rec->reject);
+                bridge->forgetCount += 2;
+                if (rec->hasOnToken) {
+                    fxForget(the, &rec->onToken);
+                    bridge->forgetCount += 1;
+                }
+                free(rec);
             }
         }
-        xsCatch {
-        }
+        xsb_drain_promises(the);
     }
-    xsEndHost(bridge->machine);
+    xsEndHost((xsMachine*)machine);
+
+    free(j->json);   /* mac_xs.c c_free's the job struct itself */
 }
 
 /* ---------------------------------------------------------------------------
@@ -375,17 +330,9 @@ void* xsb_create_machine(void)
         return NULL;
     }
     bridge->machine = machine;
-    pthread_mutex_init(&bridge->lock, NULL);
-
-    CFRunLoopSourceContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.info = bridge;
-    ctx.perform = xsb_perform;
-    bridge->source = CFRunLoopSourceCreate(NULL, 0, &ctx);
-    bridge->runloop = CFRunLoopGetCurrent();
-    CFRetain(bridge->runloop);
-    CFRunLoopAddSource(bridge->runloop, bridge->source, kCFRunLoopDefaultMode);
-
+    /* mac_xs.c's fxCreateMachinePlatform — run inside xsCreateMachine, on this
+     * thread — has already attached the worker-job and promise run-loop sources
+     * to the current run loop (this dedicated XS thread's loop). */
     xsb_install_host(machine);
     return machine;
 }
@@ -395,15 +342,10 @@ void xsb_delete_machine(void* machine)
     if (!machine)
         return;
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
+    /* xsDeleteMachine runs mac_xs.c's fxDeleteMachinePlatform, which tears down
+     * the worker/promise run-loop sources, the worker mutex, and frees any
+     * worker jobs still queued. */
     xsDeleteMachine((xsMachine*)machine);
-
-    if (bridge->source) {
-        CFRunLoopRemoveSource(bridge->runloop, bridge->source, kCFRunLoopDefaultMode);
-        CFRunLoopSourceInvalidate(bridge->source);
-        CFRelease(bridge->source);
-    }
-    if (bridge->runloop)
-        CFRelease(bridge->runloop);
 
     XSPending* p = bridge->pending;
     while (p) {
@@ -411,14 +353,6 @@ void xsb_delete_machine(void* machine)
         free(p);
         p = n;
     }
-    XSResult* r = bridge->results;
-    while (r) {
-        XSResult* n = r->next;
-        free(r->json);
-        free(r);
-        r = n;
-    }
-    pthread_mutex_destroy(&bridge->lock);
     for (size_t i = 0; i < bridge->outputCount; i++)
         free(bridge->outputs[i]);
     free(bridge->outputs);
@@ -442,33 +376,27 @@ void* xsb_context_of(void* bridge)
  * Called from Swift background threads.
  * ------------------------------------------------------------------------- */
 
-static void xsb_enqueue(XSBridge* bridge, uint32_t id, int type, const char* json)
+/* Build a worker job and hand it to mac_xs.c's queue, which serializes the
+ * enqueue under its worker mutex, signals the XS thread's run loop, and later
+ * invokes xsb_job_perform there. Called from Swift background threads. */
+static void xsb_post(XSBridge* bridge, uint32_t id, int type, const char* json)
 {
-    XSResult* r = (XSResult*)malloc(sizeof(XSResult));
-    r->id = id;
-    r->type = type;
-    r->json = strdup(json ? json : "null");
-    r->next = NULL;
-
-    pthread_mutex_lock(&bridge->lock);
-    XSResult** tail = &bridge->results;
-    while (*tail)
-        tail = &(*tail)->next;
-    *tail = r;
-    pthread_mutex_unlock(&bridge->lock);
-
-    CFRunLoopSourceSignal(bridge->source);
-    CFRunLoopWakeUp(bridge->runloop);
+    XSBJob* j = (XSBJob*)calloc(1, sizeof(XSBJob));
+    j->job.callback = xsb_job_perform;
+    j->id = id;
+    j->type = type;
+    j->json = strdup(json ? json : "null");
+    fxQueueWorkerJob(bridge->machine, j);
 }
 
 void xsb_emit_token(void* bridge, uint32_t id, const char* json)
 {
-    xsb_enqueue((XSBridge*)bridge, id, XSB_TOKEN, json);
+    xsb_post((XSBridge*)bridge, id, XSB_TOKEN, json);
 }
 
 void xsb_complete(void* bridge, uint32_t id, int success, const char* json)
 {
-    xsb_enqueue((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
+    xsb_post((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
 }
 
 /* ---------------------------------------------------------------------------
@@ -556,223 +484,10 @@ int xsb_eval(void* machine, const char* src, char** out_json, char** out_err)
         /* Drain promise jobs queued by the script — an async function's body up
          * to its first await, or an already-resolved .then chain — so they run
          * within this eval instead of waiting for an async host completion that
-         * a pure (host-call-free) agent never makes. Mirrors xsb_perform.
-         * Nested scope so xsTry's __JUMP__ does not clash with the eval try. */
-        {
-            xsTry {
-                while (the->promiseJobs) {
-                    the->promiseJobs = 0;
-                    fxRunPromiseJobs(the);
-                }
-            }
-            xsCatch {
-            }
-        }
+         * a pure (host-call-free) agent never makes. */
+        xsb_drain_promises(the);
     }
     xsEndHost((xsMachine*)machine);
 
     return ok;
 }
-
-/* DEBUG */
-
-#ifdef mxDebug
-
-void fxConnect(txMachine* the)
-{
-  if (!c_strcmp(the->name, "xst_fuzz"))
-    return;
-  if (!c_strcmp(the->name, "xst_fuzz_oss"))
-    return;
-#ifdef mxMultipleThreads
-  if (!c_strcmp(the->name, "xst262"))
-    return;
-  if (!c_strcmp(the->name, "xst-agent"))
-    return;
-#endif
-  char name[256];
-  char* colon;
-  int port;
-#if mxWindows
-  if (GetEnvironmentVariable("XSBUG_HOST", name, sizeof(name))) {
-#else
-  colon = getenv("XSBUG_HOST");
-  if ((colon) && (c_strlen(colon) + 1 < sizeof(name))) {
-    c_strcpy(name, colon);
-#endif
-    colon = strchr(name, ':');
-    if (colon == NULL)
-      port = 5002;
-    else {
-      *colon = 0;
-      colon++;
-      port = strtol(colon, NULL, 10);
-    }
-  }
-  else {
-    strcpy(name, "localhost");
-    port = 5002;
-  }
-#if mxWindows
-{
-  WSADATA wsaData;
-  struct hostent *host;
-  struct sockaddr_in address;
-  unsigned long flag;
-  if (WSAStartup(0x202, &wsaData) == SOCKET_ERROR)
-    return;
-  host = gethostbyname(name);
-  if (!host)
-    goto bail;
-  memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  memcpy(&(address.sin_addr), host->h_addr, host->h_length);
-    address.sin_port = htons(port);
-  the->connection = socket(AF_INET, SOCK_STREAM, 0);
-  if (the->connection == INVALID_SOCKET)
-    return;
-    flag = 1;
-    ioctlsocket(the->connection, FIONBIO, &flag);
-  if (connect(the->connection, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
-    if (WSAEWOULDBLOCK == WSAGetLastError()) {
-      fd_set fds;
-      struct timeval timeout = { 2, 0 }; // 2 seconds, 0 micro-seconds
-      FD_ZERO(&fds);
-      FD_SET(the->connection, &fds);
-      if (select(0, NULL, &fds, NULL, &timeout) == 0)
-        goto bail;
-      if (!FD_ISSET(the->connection, &fds))
-        goto bail;
-    }
-    else
-      goto bail;
-  }
-   flag = 0;
-   ioctlsocket(the->connection, FIONBIO, &flag);
-}
-#else
-{
-  struct sockaddr_in address;
-  int  flag;
-  memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-  address.sin_addr.s_addr = inet_addr(name);
-  if (address.sin_addr.s_addr == INADDR_NONE) {
-    struct hostent *host = gethostbyname(name);
-    if (!host)
-      return;
-    memcpy(&(address.sin_addr), host->h_addr, host->h_length);
-  }
-    address.sin_port = htons(port);
-  the->connection = socket(AF_INET, SOCK_STREAM, 0);
-  if (the->connection <= 0)
-    goto bail;
-  c_signal(SIGPIPE, SIG_IGN);
-#if mxMacOSX
-  {
-    int set = 1;
-    setsockopt(the->connection, SOL_SOCKET, SO_NOSIGPIPE, (void *)&set, sizeof(int));
-  }
-#endif
-  flag = fcntl(the->connection, F_GETFL, 0);
-  fcntl(the->connection, F_SETFL, flag | O_NONBLOCK);
-  if (connect(the->connection, (struct sockaddr*)&address, sizeof(address)) < 0) {
-       if (errno == EINPROGRESS) {
-      fd_set fds;
-      struct timeval timeout = { 2, 0 }; // 2 seconds, 0 micro-seconds
-      int error = 0;
-      unsigned int length = sizeof(error);
-      FD_ZERO(&fds);
-      FD_SET(the->connection, &fds);
-      if (select(the->connection + 1, NULL, &fds, NULL, &timeout) == 0)
-        goto bail;
-      if (!FD_ISSET(the->connection, &fds))
-        goto bail;
-      if (getsockopt(the->connection, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
-        goto bail;
-      if (error)
-        goto bail;
-    }
-    else
-      goto bail;
-  }
-  fcntl(the->connection, F_SETFL, flag);
-  c_signal(SIGPIPE, SIG_DFL);
-}
-#endif
-  return;
-bail:
-  fxDisconnect(the);
-}
-
-void fxDisconnect(txMachine* the)
-{
-#if mxWindows
-  if (the->connection != INVALID_SOCKET) {
-    closesocket(the->connection);
-    the->connection = INVALID_SOCKET;
-  }
-  WSACleanup();
-#else
-  if (the->connection >= 0) {
-    close(the->connection);
-    the->connection = -1;
-  }
-#endif
-}
-
-txBoolean fxIsConnected(txMachine* the)
-{
-  return (the->connection != mxNoSocket) ? 1 : 0;
-}
-
-txBoolean fxIsReadable(txMachine* the)
-{
-  return 0;
-}
-
-void fxReceive(txMachine* the)
-{
-  int count;
-  if (the->connection != mxNoSocket) {
-#if mxWindows
-    count = recv(the->connection, the->debugBuffer, sizeof(the->debugBuffer) - 1, 0);
-    if (count < 0)
-      fxDisconnect(the);
-    else
-      the->debugOffset = count;
-#else
-  again:
-    count = read(the->connection, the->debugBuffer, sizeof(the->debugBuffer) - 1);
-    if (count < 0) {
-      if (errno == EINTR)
-        goto again;
-      else
-        fxDisconnect(the);
-    }
-    else
-      the->debugOffset = count;
-#endif
-  }
-  the->debugBuffer[the->debugOffset] = 0;
-}
-
-void fxSend(txMachine* the, txBoolean more)
-{
-  if (the->connection != mxNoSocket) {
-#if mxWindows
-    if (send(the->connection, the->echoBuffer, the->echoOffset, 0) <= 0)
-      fxDisconnect(the);
-#else
-  again:
-    if (write(the->connection, the->echoBuffer, the->echoOffset) <= 0) {
-      if (errno == EINTR)
-        goto again;
-      else
-        fxDisconnect(the);
-    }
-#endif
-  }
-}
-
-#endif /* mxDebug */
