@@ -5,11 +5,11 @@ import PackageDescription
 // These MUST be identical across every translation unit in XSBridge: the
 // txMachine struct layout depends on them, so a mismatch is silent ABI corruption.
 let xsDefines: [CSetting] = [
-    .define("INCLUDE_XSPLATFORM"),
-    .define("XSPLATFORM", to: "\"mac_xs.h\""),
-    .define("mxProfile", to: "1"),
-    .define("mxNoConsole", to: "1"),
-    .define("mxStringInfoCacheLength", to: "4"),
+  .define("XS_ARCHIVE", to: "1"),
+  .define("INCLUDE_XSPLATFORM", to: "1"),
+  .define("XSPLATFORM", to: "\"mac_xs.h\""),
+  .define("mxDebug", to: "1"),
+  .define("mxStringInfoCacheLength", to: "4"),
 ]
 
 let headerPaths: [CSetting] = [
@@ -17,7 +17,6 @@ let headerPaths: [CSetting] = [
     .headerSearchPath("xs/includes"),
     .headerSearchPath("xs/platforms"),
     .headerSearchPath("xs/tools"),
-    .headerSearchPath("xs/tools/fdlibm"),
 ]
 
 let package = Package(

@@ -113,13 +113,13 @@ scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE in
 ```
 
 The XS sources are **not vendored**: `scripts/link-moddable.sh` symlinks the exact
-curated subset (`xs/sources`, `xs/includes`, `xs/tools/fdlibm`, the platform dispatch
-headers `xsPlatform.h`/`xsHost.h`, and the macOS port `mac_xs.h`+`mac_xs.c`) from
-`$MODDABLE/xs` into `Sources/XSBridge/xs/`. Those links are git-ignored. SwiftPM compiles
-`.c` through the directory symlinks; only `sources/`, `tools/fdlibm/` and `platforms/mac_xs.c`
-carry compiled units, which is why `platforms/` and `tools/` are linked file-by-file (their
-other `.c` — every other platform port, the xs* compilers, the YAML lib, test262 — must not
-be compiled).
+curated subset (`xs/sources`, `xs/includes`, the platform dispatch headers
+`xsPlatform.h`/`xsHost.h`, and the macOS port `mac_xs.h`+`mac_xs.c`) from `$MODDABLE/xs`
+into `Sources/XSBridge/xs/`. Those links are git-ignored. SwiftPM compiles `.c` through the
+directory symlinks; only `sources/` and `platforms/mac_xs.c` carry compiled units, which is
+why `platforms/` is linked file-by-file (its other `.c` — every other platform port — must
+not be compiled). `fdlibm` is not linked: the macOS port uses the system `libm`
+(`xsPlatform.h` maps `c_sin` → `sin`, etc.); fdlibm is only for embedded ports.
 
 The async bridge: a Promise is created **on the JS side**; the host function
 `__nativeCall(key, params, resolve, reject)` marshals params to JSON, `fxRemember`s

@@ -26,10 +26,11 @@ echo "Linking XS sources from: $SRC"
 rm -rf "$XS"
 mkdir -p "$XS/platforms" "$XS/tools"
 
-# Whole-directory links (compiled .c live only in sources/ and tools/fdlibm/).
+# Whole-directory links (compiled .c live only in sources/). fdlibm is not
+# linked: the macOS port uses the system libm (xsPlatform.h maps c_sin -> sin,
+# etc.); fdlibm is only for embedded ports that redefine those.
 ln -s "$SRC/sources"      "$XS/sources"
 ln -s "$SRC/includes"     "$XS/includes"
-ln -s "$SRC/tools/fdlibm" "$XS/tools/fdlibm"
 
 # Per-file links: these directories also hold sources we must NOT compile
 # (every other platform port, the xs* compilers, the YAML lib, test262, …).
