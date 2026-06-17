@@ -75,11 +75,17 @@ host functions and the perform callback are the only places that touch XS; Swift
 sees an `xsSlot`. The harness drives the loop with `runUntilIdle` (`CFRunLoopRunInMode`
 until `xsb_pending_count == 0`).
 
-Key build detail: `xst.h` (the platform header) leaves `fxCreateMachinePlatform`,
-`fxFindModule`/`fxLoadModule`, `fxQueuePromiseJobs`, `fxAbort`, and the shared-timer
-functions for the host program to provide (normally `xst.c`). Since we exclude `xst.c`,
-`bridge.c` supplies a minimal standalone version of these, including the promise-draining
-run loop built around the `fxQueuePromiseJobs` flag.
+Key build detail: the platform header is **`mac_xs.h`** (`XSPLATFORM="mac_xs.h"`), and the
+macOS port **`mac_xs.c`** is compiled. It provides the run-loop integration —
+`fxCreateMachinePlatform`/`fxDeleteMachinePlatform`, the cross-thread worker-job queue
+(`fxQueueWorkerJob`) and the promise run-loop source — plus module loading
+(`mxUseDefaultFindModule`/`LoadModule`). `bridge.c` only supplies `fxAbort` (which
+`mac_xs.c` omits; it normally comes from `xst.c`, which we exclude). The shared-timer
+functions are not needed: `mac_xs.h` defines `mxUseGCCAtomics`, which compiles out the
+shared-timer paths in `xsAtomics.c`. Because `mac_xs.c::fxQueuePromiseJobs` signals a
+run-loop source instead of setting `the->promiseJobs`, `bridge.c` drains microtasks
+explicitly via `mxPendingJobs` (`xsb_drain_promises`) inside each settlement's host frame,
+so `xsb_pending_count == 0` always implies the `await` continuations have run.
 
 ## Architecture
 
@@ -94,8 +100,8 @@ Sources/
   XSBridge/               # C target: XS sources + mac platform + the bridge shim
     include/module.modulemap   # exposes bridge.h to Swift
     include/bridge.h           # flat C API, NO XS macros leak across it
-    xs/                        # symlinks to $MODDABLE/xs (git-ignored; see scripts/link-moddable.sh)
-    bridge.c                   # machine lifecycle, host functions, run-loop signal, settle
+    xs/                        # symlinks to $MODDABLE/xs incl. platforms/mac_xs.c (git-ignored; see scripts/link-moddable.sh)
+    bridge.c                   # machine lifecycle, host functions, settlement via worker jobs (mac_xs.c)
   XSBridgeKit/            # Swift library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
     HostBridge.swift           # HostBridge protocol + HostResponder + @_cdecl dispatch callbacks
@@ -107,20 +113,22 @@ scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE in
 ```
 
 The XS sources are **not vendored**: `scripts/link-moddable.sh` symlinks the exact
-curated subset (`xs/sources`, `xs/includes`, the two macOS platform headers,
-`xs/tools/xst.h`, `xs/tools/fdlibm`) from `$MODDABLE/xs` into `Sources/XSBridge/xs/`.
-Those links are git-ignored. SwiftPM compiles `.c` through the directory symlinks; only
-`sources/` and `tools/fdlibm/` carry compiled units, which is why `platforms/` and
-`tools/` are linked file-by-file (their other `.c` — every platform port, the xs*
-compilers, the YAML lib, test262 — must not be compiled).
+curated subset (`xs/sources`, `xs/includes`, `xs/tools/fdlibm`, the platform dispatch
+headers `xsPlatform.h`/`xsHost.h`, and the macOS port `mac_xs.h`+`mac_xs.c`) from
+`$MODDABLE/xs` into `Sources/XSBridge/xs/`. Those links are git-ignored. SwiftPM compiles
+`.c` through the directory symlinks; only `sources/`, `tools/fdlibm/` and `platforms/mac_xs.c`
+carry compiled units, which is why `platforms/` and `tools/` are linked file-by-file (their
+other `.c` — every other platform port, the xs* compilers, the YAML lib, test262 — must not
+be compiled).
 
 The async bridge: a Promise is created **on the JS side**; the host function
-`__nativeCall(key, params, resolve, reject)` marshals params to JSON, `xsRemember`s
+`__nativeCall(key, params, resolve, reject)` marshals params to JSON, `fxRemember`s
 `resolve`/`reject`, generates an id, and posts `(id, key, jsonParams)` to Swift. Swift
-does the work off the XS run loop, then signals a **`CFRunLoopSource`** (the same run
-loop as Cocoa/Swift). The perform callback re-enters with `xsBeginHost`, looks up
-`(resolve, reject)` by id, settles the Promise, `xsForget`s, and **drains promise jobs**
-(`fxRunPromiseJobs`, as in the `xst` loop) to resume the `await` continuation.
+does the work off the XS run loop, then posts a **worker job** via `fxQueueWorkerJob`
+(mac_xs.c), which signals the XS thread's run loop. The job callback (`xsb_job_perform`)
+re-enters with `xsBeginHost`, looks up `(resolve, reject)` by id, settles the Promise,
+`fxForget`s, and **drains promise jobs** (`fxRunPromiseJobs` via `xsb_drain_promises`) to
+resume the `await` continuation.
 
 ## Critical invariants (must always hold)
 
@@ -151,10 +159,12 @@ designed for CI and non-interactive Claude Code runs. There is no separate test 
 the harness *is* the test suite. To exercise a single behaviour, run the corresponding
 agent in `agents/` from the harness.
 
-When deriving the C target, take the exact XS source list, mac platform file, and
-`#define`s from `$MODDABLE/xs/makefiles/mac` (the `xst` target) and replicate them in the
-`XSBridge` target's `cSettings`. See `$MODDABLE/documentation/xs/xst.md` for embedding XS in a
-standalone C program on macOS.
+The C target is based on the macOS port: `XSPLATFORM="mac_xs.h"` and `platforms/mac_xs.c`
+is compiled. The remaining `#define`s in `Package.swift` (`mxProfile`, `mxNoConsole`,
+`mxStringInfoCacheLength`) tune the engine; the platform-specific `mxUse*` defines come from
+`mac_xs.h` itself. The bridge was originally modelled on the `xst` target
+(`$MODDABLE/xs/makefiles/mac`, `$MODDABLE/documentation/xs/xst.md`), then rebased onto
+`mac_xs` to reuse the upstream run-loop integration.
 
 ## Behavioral guidelines
 

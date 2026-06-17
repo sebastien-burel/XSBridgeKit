@@ -6,9 +6,8 @@ import PackageDescription
 // txMachine struct layout depends on them, so a mismatch is silent ABI corruption.
 let xsDefines: [CSetting] = [
     .define("INCLUDE_XSPLATFORM"),
-    .define("XSPLATFORM", to: "\"xst.h\""),
+    .define("XSPLATFORM", to: "\"mac_xs.h\""),
     .define("mxProfile", to: "1"),
-    .define("mxDebug", to: "1"),
     .define("mxNoConsole", to: "1"),
     .define("mxStringInfoCacheLength", to: "4"),
 ]
