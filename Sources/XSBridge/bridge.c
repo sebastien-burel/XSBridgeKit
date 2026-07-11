@@ -95,6 +95,13 @@ extern void xsb_dispatch(void* bridge, uint32_t id,
                          const char* key, const char* json);
 extern char* xsb_dispatch_sync(void* bridge, const char* key, const char* json);
 
+/* Module loader hooks (Swift @_cdecl). find resolves a specifier (relative to
+ * the importer) to a canonical id; load returns that id's source. Both return a
+ * malloc'd UTF-8 string the C side frees, or NULL. */
+extern char* xsb_dispatch_find_module(void* bridge, const char* specifier,
+                                      const char* importer);
+extern char* xsb_dispatch_load_module(void* bridge, const char* id);
+
 static void xsb_job_perform(void* machine, void* job);
 
 /* ---------------------------------------------------------------------------
@@ -206,6 +213,57 @@ static void xsb_install_host(xsMachine* machine)
         }
     }
     xsEndHost(machine);
+}
+
+/* ---------------------------------------------------------------------------
+ * Module loader. mac_xs.h turns the XS default find/load module OFF, so we
+ * supply both. Policy lives in Swift: fxFindModule asks the host to resolve a
+ * specifier (relative to the importing module) to a canonical id; fxLoadModule
+ * asks for that id's source, which we parse in memory as a Module (no
+ * mxProgramFlag — so `import`/`export` are legal) and resolve. A NULL from
+ * either surfaces to JS as a module-not-found rejection.
+ * ------------------------------------------------------------------------- */
+
+txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
+{
+    XSBridge* bridge = (XSBridge*)xsGetContext(the);
+    char specifier[C_PATH_MAX];
+    fxToStringBuffer(the, slot, specifier, sizeof(specifier));
+    /* moduleID is the importer's id (XS_NO_ID for a top-level / dynamic import). */
+    const char* importer = (moduleID != XS_NO_ID) ? fxGetKeyName(the, moduleID) : NULL;
+
+    char* resolved = xsb_dispatch_find_module(bridge, specifier, importer);
+    if (!resolved)
+        return XS_NO_ID;
+    txID id = fxNewNameC(the, resolved);
+    free(resolved);
+    return id;
+}
+
+void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
+{
+    XSBridge* bridge = (XSBridge*)xsGetContext(the);
+    const char* id = fxGetKeyName(the, moduleID);
+
+    char* source = xsb_dispatch_load_module(bridge, id);
+    if (!source)
+        return;   /* module stays unresolved -> JS "module not found" */
+
+    txUnsigned flags = 0;   /* Module goal; a Script would set mxProgramFlag. */
+    size_t len = c_strlen(id);
+    if (len >= 5 && c_strcmp(id + (len - 5), ".json") == 0)
+        flags |= mxJSONModuleFlag;
+
+    /* fxParseScript catches its own parse jump and returns NULL on a syntax
+     * error (no longjmp), so freeing source right after is always safe. */
+    txStringCStream stream;
+    stream.buffer = source;
+    stream.offset = 0;
+    stream.size = (txSize)c_strlen(source);
+    txScript* script = fxParseScript(the, &stream, fxStringCGetter, flags);
+    free(source);
+    if (script)
+        fxResolveModule(the, module, moduleID, script, C_NULL, C_NULL);
 }
 
 /* ---------------------------------------------------------------------------

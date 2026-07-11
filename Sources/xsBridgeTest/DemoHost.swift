@@ -54,6 +54,21 @@ final class DemoHost: HostBridge {
         }
     }
 
+    // MARK: - ES modules (in-memory map, exercises the custom loader)
+
+    /// `reexport` uses a static `import ... from` — proving module-goal parsing
+    /// works, not just dynamic import().
+    private let modules: [String: String] = [
+        "answer": "export const answer = 42;",
+        "reexport": "import { answer } from 'answer';\nexport const doubled = answer * 2;",
+    ]
+
+    func findModule(specifier: String, importer: String?) -> String? {
+        modules[specifier] != nil ? specifier : nil
+    }
+
+    func loadModule(id: String) -> String? { modules[id] }
+
     func handleSync(key: String, paramsJSON: String) -> String {
         switch key {
         case "add":

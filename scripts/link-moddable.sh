@@ -38,7 +38,19 @@ ln -s "$SRC/includes"     "$XS/includes"
 # integration (worker-job queue + promise source) and the xsbug transport.
 ln -s "$SRC/platforms/xsPlatform.h" "$XS/platforms/xsPlatform.h"
 ln -s "$SRC/platforms/xsHost.h"     "$XS/platforms/xsHost.h"
-ln -s "$SRC/platforms/mac_xs.h"     "$XS/platforms/mac_xs.h"
 ln -s "$SRC/platforms/mac_xs.c"     "$XS/platforms/mac_xs.c"
+
+# mac_xs.h is materialized as an EDITABLE COPY (not a symlink) so the bridge can
+# override the module-loader policy. XSBridge supplies its own fxFindModule /
+# fxLoadModule (bridge.c) that resolve specifiers through the Swift host and hand
+# back module source in memory (no archive / preload) — which requires the XS
+# default loader turned OFF. This is the one spot we diverge from a pristine
+# checkout; keeping it in the script (not a committed vendored file) keeps it
+# reproducible and re-applied on every link.
+cp "$SRC/platforms/mac_xs.h" "$XS/platforms/mac_xs.h"
+sed -i '' \
+  -e 's/#define mxUseDefaultFindModule 1/#define mxUseDefaultFindModule 0/' \
+  -e 's/#define mxUseDefaultLoadModule 1/#define mxUseDefaultLoadModule 0/' \
+  "$XS/platforms/mac_xs.h"
 
 echo "Done. Now: swift build -c release"

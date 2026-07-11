@@ -34,11 +34,21 @@ public protocol HostBridge: AnyObject {
     func handle(key: String, paramsJSON: String, responder: HostResponder)
     /// Synchronous host call returning a JSON result immediately.
     func handleSync(key: String, paramsJSON: String) -> String
+
+    /// Resolve an ES module `specifier` (relative to `importer`, nil at the top
+    /// level) to a canonical module id, or nil if it can't be resolved. Called
+    /// synchronously on the engine thread during `import`. Default: no modules.
+    func findModule(specifier: String, importer: String?) -> String?
+    /// Return the source for a module `id` produced by `findModule`, or nil if
+    /// absent. Called synchronously during `import`. Default: no modules.
+    func loadModule(id: String) -> String?
 }
 
 public extension HostBridge {
     var prelude: String { "" }
     func handleSync(key: String, paramsJSON: String) -> String { "null" }
+    func findModule(specifier: String, importer: String?) -> String? { nil }
+    func loadModule(id: String) -> String? { nil }
 }
 
 // MARK: - C-callable dispatch entry points (resolved at executable link)
@@ -70,4 +80,24 @@ func xsb_dispatch_sync(_ bridge: UnsafeMutableRawPointer?,
     let json = json.map { String(cString: $0) } ?? "[]"
     // strdup so the C side owns the buffer and frees it after JSON.parse.
     return strdup(engine.host.handleSync(key: key, paramsJSON: json))
+}
+
+@_cdecl("xsb_dispatch_find_module")
+func xsb_dispatch_find_module(_ bridge: UnsafeMutableRawPointer?,
+                              _ specifier: UnsafePointer<CChar>?,
+                              _ importer: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let bridge = bridge, let engine = engine(for: bridge),
+          let specifier = specifier else { return nil }
+    let spec = String(cString: specifier)
+    let imp = importer.map { String(cString: $0) }
+    guard let resolved = engine.host.findModule(specifier: spec, importer: imp) else { return nil }
+    return strdup(resolved)   // C frees it
+}
+
+@_cdecl("xsb_dispatch_load_module")
+func xsb_dispatch_load_module(_ bridge: UnsafeMutableRawPointer?,
+                              _ id: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let bridge = bridge, let engine = engine(for: bridge), let id = id else { return nil }
+    guard let source = engine.host.loadModule(id: String(cString: id)) else { return nil }
+    return strdup(source)   // C frees it
 }

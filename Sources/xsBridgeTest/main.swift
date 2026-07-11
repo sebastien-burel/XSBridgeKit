@@ -313,4 +313,39 @@ do {
     phaseResult(5, before)
 }
 
+// ---- Phase 6: ES module loader (custom fxFindModule / fxLoadModule) ----
+do {
+    let before = failures
+    print("PHASE 6 — ES module loader")
+
+    if let engine = XSEngine(host: DemoHost()) {
+        // Dynamic import resolves through the host loader; the imported module
+        // itself uses a static `import ... from` (module goal), so a green here
+        // proves both the loader wiring and module-goal parsing.
+        _ = try? engine.eval("""
+            globalThis.__m = 'pending';
+            import('reexport')
+              .then(function (m) { globalThis.__m = 'ok:' + m.doubled; })
+              .catch(function (e) { globalThis.__m = 'err:' + String(e); });
+            """)
+        engine.runUntilIdle()
+        let r = (try? engine.eval("globalThis.__m")) ?? "<none>"
+        check("dynamic import + static re-export == 84 (got \(r))", r == "\"ok:84\"")
+
+        // A missing module rejects cleanly — no crash, catchable in JS.
+        _ = try? engine.eval("""
+            globalThis.__n = 'pending';
+            import('ghost').then(function () { globalThis.__n = 'resolved'; })
+                           .catch(function () { globalThis.__n = 'rejected'; });
+            """)
+        engine.runUntilIdle()
+        let r2 = (try? engine.eval("globalThis.__n")) ?? "<none>"
+        check("missing module rejects (got \(r2))", r2 == "\"rejected\"")
+    } else {
+        check("create machine", false)
+    }
+
+    phaseResult(6, before)
+}
+
 exit(failures == 0 ? 0 : 1)
