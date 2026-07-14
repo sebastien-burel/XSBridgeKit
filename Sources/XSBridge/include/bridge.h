@@ -91,10 +91,6 @@ void xsBridgeCollectGarbage(void* machine);
 /* Leak accounting: total xsRemember vs xsForget calls (must match when idle). */
 void xsBridgeDebugCounts(void* machine, uint32_t* remembered, uint32_t* forgotten);
 
-/* Captured print() output. */
-int xsBridgeOutputCount(void* machine);
-const char* xsBridgeOutputAt(void* machine, int index);
-
 /* The XS-typed helpers for consumer C host-function targets (xsBridgePromise)
  * live in bridgeXS.h, which is NOT part of the clang module — include it
  * textually after xs.h in C translation units only. */

@@ -21,8 +21,9 @@ Target: **macOS, Apple Silicon (M3 Pro)**, Swift toolchain. The library has no U
 
 ## How it works
 
-**Consumer C host functions.** The C layer hardcodes no host capabilities — it installs
-only `print`. A consumer supplies its own small C target (compiled with the **same XS
+**Consumer C host functions.** The C layer hardcodes no host capabilities and installs
+nothing — even `print` is consumer-supplied (the demo host and the CLI each install
+their own). A consumer supplies its own small C target (compiled with the **same XS
 defines** as `XSBridge` — the `txMachine` ABI depends on them) whose install function
 (`xsNewHostFunction` + `xsSet`, run via `XSEngine.withMachine`) registers each native
 capability directly. Each C host function marshals its arguments to plain C values, and —
@@ -50,8 +51,8 @@ Consumers `import XSBridgeKit` (plus `XSBridge` for the flat settle functions).
 whole call (3 roots total: `xsBridgePromise(the, &xsArg(1))`). Swift emits tokens via
 `xsBridgeEmitToken` (message kind `XSB_TOKEN`) which the job callback delivers as
 `onToken(delta)` while keeping the call open; a final `xsBridgeComplete`
-(`XSB_RESOLVE`/`XSB_REJECT`) settles and forgets all roots. Tokens use `xsb_find_pending`
-(non-unlinking), settlements use `xsb_unlink_pending`.
+(`XSB_RESOLVE`/`XSB_REJECT`) settles and forgets all roots. Tokens use `xsBridgeFindMessage`
+(non-unlinking), settlements use `xsBridgeUnlinkMessage`.
 
 **Reject path & GC.** `host.fail` exercises the reject path; `xsBridgeCollectGarbage` forces
 GC on the XS thread and `runUntilIdleForcingGC` drives a forced full GC on every run-loop
@@ -60,10 +61,11 @@ completion and no id crosstalk. `DemoHost` uses a small `callLatency` (5 ms, ech
 larger `streamLatency` (50 ms, between tokens).
 
 The machine **context is a `XSBridge*`** (allocated in `xsBridgeCreateMachine`), holding:
-the pending `{id → (resolve,reject)}` records, remember/forget counters, module status,
-captured `print` output, and `swiftContext` (the unretained `XSEngine` pointer, set via
+the in-flight `XSMessage` records (`{id → (resolve,reject)}`), remember/forget counters,
+module status, and `swiftContext` (the unretained `XSEngine` pointer, set via
 `xsBridgeSetContext`, recoverable from consumer `@_cdecl` functions via
-`xsBridgeGetContext`).
+`xsBridgeGetContext`). The `print` capture asserted by the harness lives in
+`xsBridgeTestC` (`xsBridgeTestOutputCount/At`), not in the bridge.
 
 Async flow: JS `host.echo(x)` enters the consumer's C host function, which stringifies the
 argument, calls `xsBridgePromise` — creates the Promise **in C** (`fxNewPromiseCapability`),
@@ -71,7 +73,7 @@ copies resolve/reject into a malloc'd record and `fxRemember`s them **before any
 allocation** (so GC tracks/relocates them), sets `xsResult` to the promise — then hands
 `(bridge, id, json)` to its Swift `@_cdecl` function. Swift works on a background
 `DispatchQueue`, then `xsBridgeComplete` (bg thread) posts a worker job and wakes the XS
-run loop. The job callback `xsb_job_perform` (XS thread) settles via
+run loop. The job callback `xsBridgeEventPerform` (XS thread) settles via
 `xsCallFunction1(xsAccess(rec->resolve),…)`, `fxForget`s, frees the record, and drains
 `fxRunPromiseJobs` to resume the `await`.
 
@@ -90,7 +92,7 @@ macOS port **`mac_xs.c`** is compiled. It provides the run-loop integration —
 functions are not needed: `mac_xs.h` defines `mxUseGCCAtomics`, which compiles out the
 shared-timer paths in `xsAtomics.c`. Because `mac_xs.c::fxQueuePromiseJobs` signals a
 run-loop source instead of setting `the->promiseJobs`, `bridge.c` drains microtasks
-explicitly via `mxPendingJobs` (`xsb_drain_promises`) inside each settlement's host frame,
+explicitly via `mxPendingJobs` (`xsBridgeDrainPromises`) inside each settlement's host frame,
 so `xsBridgePendingCount == 0` always implies the `await` continuations have run.
 
 ## Architecture
@@ -112,11 +114,11 @@ Sources/
   XSBridgeKit/            # Swift library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
   xsBridgeTestC/          # C side of the demo host (consumer host-function pattern)
-    demoHost.c                 # host.echo/stream/fail/add — xsBridgePromise + @_cdecl calls into Swift
+    demoHost.c                 # print (+capture) + host.echo/stream/fail/add — xsBridgePromise + @_cdecl calls into Swift
   xsBridgeTest/           # Swift executable: runner + test harness
     DemoHost.swift             # Swift side of the demo host: @_cdecl entry points (regression suite)
     main.swift                 # runs the test agents, asserts, exits non-zero on any failure
-  xsBridgeCliC/           # C side of the CLI sandbox (getCurrentTime)
+  xsBridgeCliC/           # C side of the CLI sandbox (print, getCurrentTime)
   xsBridgeCli/            # Swift executable: sandbox for experiments (eval / runModule)
 agents/                   # JS test scripts: echo.js, stream.js, concurrent.js, error.js, sequential.js
 scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE into Sources/XSBridge/xs/
@@ -136,9 +138,9 @@ The async bridge: the Promise is created **in C** by `xsBridgePromise`
 generates an id, and sets `xsResult` to the promise; the consumer's host function then
 posts `(bridge, id, params)` to Swift. Swift does the work off the XS run loop, then posts
 a **worker job** via `fxQueueWorkerJob` (mac_xs.c), which signals the XS thread's run
-loop. The job callback (`xsb_job_perform`) re-enters with `xsBeginHost`, looks up
+loop. The job callback (`xsBridgeEventPerform`) re-enters with `xsBeginHost`, looks up
 `(resolve, reject)` by id, settles the Promise, `fxForget`s, and **drains promise jobs**
-(`fxRunPromiseJobs` via `xsb_drain_promises`) to resume the `await` continuation.
+(`fxRunPromiseJobs` via `xsBridgeDrainPromises`) to resume the `await` continuation.
 
 ## Critical invariants (must always hold)
 

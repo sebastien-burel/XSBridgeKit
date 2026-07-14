@@ -31,12 +31,12 @@ engine.withMachine {
 
 do {
   if CommandLine.arguments.count > 1 {
-    // argv[1] = fichier JS, exécuté comme module ES (chargé par fxFindModule/
-    // fxLoadModule côté C — imports relatifs contre l'importeur, extensions
-    // explicites, top-level await). Throw si le module rejette.
-    try engine.runModule(CommandLine.arguments[1])
-    if CommandLine.arguments.count > 2 {
-      try engine.runModule(CommandLine.arguments[2])
+    // argv[1...] = fichiers JS, exécutés en séquence comme modules ES sur la
+    // même machine (chargés par fxFindModule/fxLoadModule côté C — imports
+    // relatifs contre l'importeur, extensions explicites, top-level await ;
+    // cache de modules partagé entre les runs). Throw si un module rejette.
+    for path in CommandLine.arguments.dropFirst() {
+      try engine.runModule(path)
     }
   }
   else {

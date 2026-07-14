@@ -12,6 +12,7 @@
 #include "bridgeXS.h"
 #include "demoHost.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +21,48 @@ extern double xsbDemoAdd(double a, double b);
 extern void xsbDemoEcho(void* bridge, uint32_t id, const char* json);
 extern void xsbDemoFail(void* bridge, uint32_t id);
 extern void xsbDemoStream(void* bridge, uint32_t id);
+
+/* ---- print + capture (harness assertions) --------------------------------
+ * One global store, reset at each install: the harness runs one printing
+ * machine at a time, and every makeEngine() reinstalls (so re-arms) it. */
+
+static char** gOutputs;
+static size_t gOutputCount;
+static size_t gOutputCap;
+
+static void xs_demo_reset_outputs(void)
+{
+    for (size_t i = 0; i < gOutputCount; i++)
+        free(gOutputs[i]);
+    free(gOutputs);
+    gOutputs = NULL;
+    gOutputCount = gOutputCap = 0;
+}
+
+int xsBridgeTestOutputCount(void)
+{
+    return (int)gOutputCount;
+}
+
+const char* xsBridgeTestOutputAt(int index)
+{
+    if (index < 0 || index >= (int)gOutputCount)
+        return NULL;
+    return gOutputs[index];
+}
+
+/* print(x) — logs to stdout and captures the value for the harness to assert. */
+static void xs_demo_print(xsMachine* the)
+{
+    const char* s = (xsToInteger(xsArgc) > 0) ? xsToString(xsArg(0)) : "";
+    if (gOutputCount == gOutputCap) {
+        size_t ncap = gOutputCap ? gOutputCap * 2 : 8;
+        gOutputs = (char**)realloc(gOutputs, ncap * sizeof(char*));
+        gOutputCap = ncap;
+    }
+    gOutputs[gOutputCount++] = strdup(s);
+    fprintf(stdout, "%s\n", s);
+}
 
 /* host.add(a, b) — synchronous JS -> Swift -> JS. */
 static void xs_demo_add(xsMachine* the)
@@ -33,8 +76,7 @@ static void xs_demo_add(xsMachine* the)
 static void xs_demo_echo(xsMachine* the)
 {
     void* bridge = xsGetContext(the);
-    xsResult = xsCall1(xsGet(xsGlobal, xsID("JSON")), xsID("stringify"), xsArg(0));
-    char* json = strdup(xsToString(xsResult));
+    char* json = xsBridgeArgJSON(the, 0);
     uint32_t id = xsBridgePromise(the, NULL);   /* xsResult = the promise */
     xsbDemoEcho(bridge, id, json);
     free(json);
@@ -58,10 +100,14 @@ static void xs_demo_stream(xsMachine* the)
 
 void xsBridgeTestInstall(void* machine)
 {
+    xs_demo_reset_outputs();
     xsBeginHost((xsMachine*)machine);
     {
         xsVars(2);
         xsTry {
+            xsVar(0) = xsNewHostFunction(xs_demo_print, 1);
+            xsSet(xsGlobal, xsID("print"), xsVar(0));
+
             xsVar(0) = xsNewObject();
             xsSet(xsGlobal, xsID("host"), xsVar(0));
 

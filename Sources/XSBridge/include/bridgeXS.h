@@ -12,10 +12,15 @@
 
 /* Create the JS Promise for an in-flight native call. Sets xsResult to the
  * promise, roots its resolve/reject (plus `onToken` if non-NULL — pass a
- * pointer to an argument slot, e.g. &xsArg(1)) in a pending record, and
+ * pointer to an argument slot, e.g. &xsArg(1)) in a message record, and
  * returns the call id. Call from inside a C host function, then hand
  * (xsGetContext(the), id) to Swift, which settles later with
  * xsBridgeComplete / xsBridgeEmitToken. */
 uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken);
+
+/* JSON.stringify(xsArg(index)) as a malloc'd UTF-8 string (free() after
+ * handing off to Swift). Uses xsResult as scratch — call it BEFORE
+ * xsBridgePromise. */
+char* xsBridgeArgJSON(xsMachine* the, int index);
 
 #endif /* XSB_BRIDGE_XS_H */

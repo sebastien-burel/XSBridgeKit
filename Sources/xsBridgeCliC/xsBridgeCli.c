@@ -9,10 +9,18 @@
 #include "bridge.h"
 #include "xsBridgeCli.h"
 #include <sys/time.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 
 extern char* xsbGetCurrentTime(void* context);
+
+/* print(x) — the bridge installs nothing; even print is consumer-supplied. */
+static void xs_cli_print(xsMachine* the)
+{
+  const char* s = (xsToInteger(xsArgc) > 0) ? xsToString(xsArg(0)) : "";
+  fprintf(stdout, "%s\n", s);
+}
 
 void xsGetCurrentTime(xsMachine* the)
 {
@@ -31,6 +39,9 @@ void xsBridgeCliInstall(void* machine)
   {
     xsVars(1);
     xsTry {
+      xsVar(0) = xsNewHostFunction(xs_cli_print, 1);
+      xsSet(xsGlobal, xsID("print"), xsVar(0));
+
       xsVar(0) = xsNewHostFunction(xsGetCurrentTime, 0);
       xsSet(xsGlobal, xsID("getCurrentTime"), xsVar(0));
     }

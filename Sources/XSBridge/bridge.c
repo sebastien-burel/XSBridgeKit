@@ -3,13 +3,13 @@
  *
  * The asynchronous bridge: a consumer's C host function calls xsBridgePromise,
  * which creates the JS Promise here (fxNewPromiseCapability), roots its
- * resolve/reject (fxRemember) in a pending record, and returns an id. The host
+ * resolve/reject (fxRemember) in a message record, and returns an id. The host
  * function hands (bridge, id) to Swift; Swift settles later from a background
  * queue by posting a worker job (fxQueueWorkerJob, from the macOS platform
  * port mac_xs.c). The job callback, run on the XS thread, resolves/rejects,
  * fxForgets, and drains promise jobs to resume the awaiting JS continuation.
  * mac_xs.c owns the run-loop integration (worker-job queue + promise source);
- * this file holds the pending-call bookkeeping and the settlement logic.
+ * this file holds the message bookkeeping and the settlement logic.
  *
  * Invariants: XS is single-threaded (all machine access on the run-loop thread);
  * no xsSlot crosses into Swift (only opaque ids + UTF-8 JSON); every Swift->XS
@@ -57,45 +57,41 @@ enum { XSB_REJECT = 0, XSB_RESOLVE = 1, XSB_TOKEN = 2 };
  * kept in C memory and rooted via fxRemember; the record's address must be
  * stable while remembered (the GC root list points at &resolve etc). onToken is
  * present only for streaming calls and lives for the whole call. XS-thread only. */
-typedef struct XSPending {
+typedef struct XSMessage {
     uint32_t id;
     txSlot resolve;
     txSlot reject;
     txSlot onToken;
     int hasOnToken;
-    struct XSPending* next;
-} XSPending;
+    struct XSMessage* next;
+} XSMessage;
 
 /* A unit of work handed back from a Swift background thread to the XS thread via
  * mac_xs.c's worker-job queue. The txWorkerJob header MUST be first: the queue
  * links and c_free's the struct by that header. Carries a streamed token
  * (XSB_TOKEN, keeps the call open) or the final settlement (XSB_RESOLVE/REJECT). */
-typedef struct XSBJob {
+typedef struct XSEvent {
     txWorkerJob job;    /* { next, callback } — must be first */
     uint32_t id;
     int type;
     char* json;         /* token delta / result value as JSON (owned) */
-} XSBJob;
+} XSEvent;
 
 typedef struct XSBridge {
     xsMachine* machine;
     void* swiftContext;     /* opaque Swift pointer (xsBridgeSet/GetContext) */
     uint32_t nextId;
-    XSPending* pending;    /* XS-thread only */
+    XSMessage* messages;   /* in-flight calls, XS-thread only */
 
     uint32_t rememberCount; /* leak accounting */
     uint32_t forgetCount;
-
-    char** outputs;         /* captured print() output, XS-thread only */
-    size_t outputCount;
-    size_t outputCap;
 
     int moduleStatus;       /* xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected */
     char* moduleError;      /* rejection message (malloc'd), XS-thread only */
 } XSBridge;
 
-static void xsb_job_perform(void* machine, void* job);
-static void xsb_drain_promises(txMachine* the);
+static void xsBridgeEventPerform(void* machine, void* job);
+static void xsBridgeDrainPromises(txMachine* the);
 
 /* ---------------------------------------------------------------------------
  * Native-call entry — the one helper consumer C host functions need. The C
@@ -108,12 +104,12 @@ static void xsb_drain_promises(txMachine* the);
 /* Create the Promise for an in-flight native call: build a promise capability,
  * copy resolve/reject (+ optional onToken) into stable C memory and root them
  * BEFORE any further allocation (the stack temporaries keep them alive up to
- * that point), link the pending record, set xsResult to the promise and return
+ * that point), link the message record, set xsResult to the promise and return
  * the id. Must run inside a host frame (a C host function). */
 uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext(the);
-    XSPending* rec = (XSPending*)calloc(1, sizeof(XSPending));
+    XSMessage* rec = (XSMessage*)calloc(1, sizeof(XSMessage));
     txSlot* resolveFunction;
     txSlot* rejectFunction;
 
@@ -138,43 +134,18 @@ uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken)
         rec->hasOnToken = 1;
         bridge->rememberCount += 1;
     }
-    rec->next = bridge->pending;
-    bridge->pending = rec;
+    rec->next = bridge->messages;
+    bridge->messages = rec;
     return rec->id;
 }
 
-static void xsb_capture_output(XSBridge* bridge, const char* s)
+/* JSON.stringify(xsArg(index)) as a malloc'd UTF-8 string — the marshalling
+ * half of a host function (free() it after handing off to Swift). Uses
+ * xsResult as scratch: call it BEFORE xsBridgePromise. */
+char* xsBridgeArgJSON(xsMachine* the, int index)
 {
-    if (bridge->outputCount == bridge->outputCap) {
-        size_t ncap = bridge->outputCap ? bridge->outputCap * 2 : 8;
-        bridge->outputs = (char**)realloc(bridge->outputs, ncap * sizeof(char*));
-        bridge->outputCap = ncap;
-    }
-    bridge->outputs[bridge->outputCount++] = strdup(s);
-}
-
-/* print(x) — logs to stdout and captures the value for the harness to assert. */
-static void fx_print(xsMachine* the)
-{
-    XSBridge* bridge = (XSBridge*)xsGetContext(the);
-    const char* s = (xsToInteger(xsArgc) > 0) ? xsToString(xsArg(0)) : "";
-    xsb_capture_output(bridge, s);
-    fprintf(stdout, "%s\n", s);
-}
-
-static void xsb_install_host(xsMachine* machine)
-{
-  xsBeginHost(machine);
-  {
-    xsVars(1);
-    xsTry {
-      xsVar(0) = xsNewHostFunction(fx_print, 1);
-      xsSet(xsGlobal, xsID("print"), xsVar(0));
-    }
-    xsCatch {
-    }
-  }
-  xsEndHost(machine);
+  xsResult = xsCall1(xsGet(xsGlobal, xsID("JSON")), xsID("stringify"), xsArg(index));
+  return strdup(xsToString(xsResult));
 }
 
 /* ---------------------------------------------------------------------------
@@ -241,7 +212,7 @@ txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
 
 /* Parse a script/module file with the XS parser (macos_xs.c pattern), source
  * map indirection included. Returns NULL on any error (file missing, syntax). */
-static txScript* xsb_load_script(txMachine* the, txString path, txUnsigned flags)
+static txScript* xsBridgeLoadScript(txMachine* the, txString path, txUnsigned flags)
 {
     txParser _parser;
     txParser* parser = &_parser;
@@ -295,7 +266,7 @@ static txScript* xsb_load_script(txMachine* the, txString path, txUnsigned flags
  * script struct and each buffer must be its own malloc'd block.
  * ------------------------------------------------------------------------- */
 
-static int xsb_read_atom(FILE* file, txU4* size, txU4* type)
+static int xsBridgeReadAtom(FILE* file, txU4* size, txU4* type)
 {
     txU1 b[8];
     if (fread(b, 8, 1, file) != 1)
@@ -305,7 +276,7 @@ static int xsb_read_atom(FILE* file, txU4* size, txU4* type)
     return 1;
 }
 
-static txScript* xsb_read_binary(txString path)
+static txScript* xsBridgeReadBinary(txString path)
 {
     FILE* file = fopen(path, "rb");
     txScript* script = NULL;
@@ -318,10 +289,10 @@ static txScript* xsb_read_binary(txString path)
     script = (txScript*)calloc(1, sizeof(txScript));
 
     reason = "bad signature";
-    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_BINARY)
+    if (!xsBridgeReadAtom(file, &size, &type) || type != XS_ATOM_BINARY)
         goto bail;
     reason = "bad version atom";
-    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_VERSION
+    if (!xsBridgeReadAtom(file, &size, &type) || type != XS_ATOM_VERSION
         || size != 8 + sizeof(script->version)
         || fread(script->version, sizeof(script->version), 1, file) != 1)
         goto bail;
@@ -337,7 +308,7 @@ static txScript* xsb_read_binary(txString path)
         goto bail;
 
     reason = "bad symbols atom";
-    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_SYMBOLS || size <= 8)
+    if (!xsBridgeReadAtom(file, &size, &type) || type != XS_ATOM_SYMBOLS || size <= 8)
         goto bail;
     script->symbolsSize = (txSize)(size - 8);
     script->symbolsBuffer = (txByte*)malloc(script->symbolsSize);
@@ -345,7 +316,7 @@ static txScript* xsb_read_binary(txString path)
         goto bail;
 
     reason = "bad code atom";
-    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_CODE || size <= 8)
+    if (!xsBridgeReadAtom(file, &size, &type) || type != XS_ATOM_CODE || size <= 8)
         goto bail;
     script->codeSize = (txSize)(size - 8);
     script->codeBuffer = (txByte*)malloc(script->codeSize);
@@ -369,14 +340,14 @@ void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
     txSize length = mxStringLength(path);
     txScript* script;
     if ((length > 4) && !c_strcmp(path + length - 4, ".xsb"))
-        script = xsb_read_binary(path);
+        script = xsBridgeReadBinary(path);
     else {
 #ifdef mxDebug
         txUnsigned flags = mxDebugFlag;
 #else
         txUnsigned flags = 0;
 #endif
-        script = xsb_load_script(the, path, flags);
+        script = xsBridgeLoadScript(the, path, flags);
     }
     if (script)
         fxResolveModule(the, module, moduleID, script, C_NULL, C_NULL);
@@ -390,13 +361,13 @@ void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
  * the run loop; poll xsBridgeModuleStatus once idle.
  * ------------------------------------------------------------------------- */
 
-static void xsb_module_fulfilled(xsMachine* the)
+static void xsBridgeModuleFulfilled(xsMachine* the)
 {
   XSBridge* bridge = (XSBridge*)xsGetContext(the);
   bridge->moduleStatus = 1;
 }
 
-static void xsb_module_rejected(xsMachine* the)
+static void xsBridgeModuleRejected(xsMachine* the)
 {
   XSBridge* bridge = (XSBridge*)xsGetContext(the);
   bridge->moduleStatus = 2;
@@ -428,8 +399,8 @@ void xsBridgeRunModule(void* machine, const char* path)
       mxDub();
       fxGetID(the, mxID(_then));
       mxCall();
-      fxNewHostFunction(the, xsb_module_fulfilled, 1, XS_NO_ID, XS_NO_ID);
-      fxNewHostFunction(the, xsb_module_rejected, 1, XS_NO_ID, XS_NO_ID);
+      fxNewHostFunction(the, xsBridgeModuleFulfilled, 1, XS_NO_ID, XS_NO_ID);
+      fxNewHostFunction(the, xsBridgeModuleRejected, 1, XS_NO_ID, XS_NO_ID);
       mxRunCount(2);
       mxPop();
     }
@@ -438,7 +409,7 @@ void xsBridgeRunModule(void* machine, const char* path)
       free(bridge->moduleError);
       bridge->moduleError = strdup(xsToString(xsException));
     }
-    xsb_drain_promises(the);
+    xsBridgeDrainPromises(the);
   }
   xsEndHost(the);
 }
@@ -454,10 +425,10 @@ int xsBridgeModuleStatus(void* machine, char** out_err)
  * Run-loop perform: settle promises on the XS thread.
  * ------------------------------------------------------------------------- */
 
-static XSPending* xsb_unlink_pending(XSBridge* bridge, uint32_t id)
+static XSMessage* xsBridgeUnlinkMessage(XSBridge* bridge, uint32_t id)
 {
-    XSPending** addr = &bridge->pending;
-    XSPending* p;
+    XSMessage** addr = &bridge->messages;
+    XSMessage* p;
     while ((p = *addr)) {
         if (p->id == id) {
             *addr = p->next;
@@ -468,9 +439,9 @@ static XSPending* xsb_unlink_pending(XSBridge* bridge, uint32_t id)
     return NULL;
 }
 
-static XSPending* xsb_find_pending(XSBridge* bridge, uint32_t id)
+static XSMessage* xsBridgeFindMessage(XSBridge* bridge, uint32_t id)
 {
-    for (XSPending* p = bridge->pending; p; p = p->next)
+    for (XSMessage* p = bridge->messages; p; p = p->next)
         if (p->id == id)
             return p;
     return NULL;
@@ -478,10 +449,10 @@ static XSPending* xsb_find_pending(XSBridge* bridge, uint32_t id)
 
 /* Drain the microtask (promise jobs) queue to quiescence, within a host frame.
  * mac_xs.c's fxQueuePromiseJobs signals a run-loop source rather than setting a
- * flag, so we drain explicitly here to guarantee that once a call's pending
+ * flag, so we drain explicitly here to guarantee that once a call's message
  * record is gone, its `await` continuation has already run (the harness treats
- * pending_count == 0 as "fully settled"). Must be called inside xsBeginHost. */
-static void xsb_drain_promises(txMachine* the)
+ * pendingCount == 0 as "fully settled"). Must be called inside xsBeginHost. */
+static void xsBridgeDrainPromises(txMachine* the)
 {
     xsTry {
         while (mxPendingJobs.value.reference->next)
@@ -494,9 +465,9 @@ static void xsb_drain_promises(txMachine* the)
 /* Worker-job callback: mac_xs.c invokes it on the XS thread (unframed) for each
  * job posted via fxQueueWorkerJob. Applies one streamed token or one final
  * settlement, then drains promise jobs. */
-static void xsb_job_perform(void* machine, void* job_)
+static void xsBridgeEventPerform(void* machine, void* job_)
 {
-    XSBJob* j = (XSBJob*)job_;
+    XSEvent* j = (XSEvent*)job_;
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
 
     xsBeginHost((xsMachine*)machine);
@@ -504,7 +475,7 @@ static void xsb_job_perform(void* machine, void* job_)
         xsVars(2);
         if (j->type == XSB_TOKEN) {
             /* Reverse channel: invoke onToken(delta), keep the call open. */
-            XSPending* rec = xsb_find_pending(bridge, j->id);
+            XSMessage* rec = xsBridgeFindMessage(bridge, j->id);
             if (rec && rec->hasOnToken) {
                 xsTry {
                     xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
@@ -516,7 +487,7 @@ static void xsb_job_perform(void* machine, void* job_)
             }
         } else {
             /* Final settlement: resolve/reject, then forget all roots. */
-            XSPending* rec = xsb_unlink_pending(bridge, j->id);
+            XSMessage* rec = xsBridgeUnlinkMessage(bridge, j->id);
             if (rec) {
                 xsTry {
                     xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
@@ -538,7 +509,7 @@ static void xsb_job_perform(void* machine, void* job_)
                 free(rec);
             }
         }
-        xsb_drain_promises(the);
+        xsBridgeDrainPromises(the);
     }
     xsEndHost((xsMachine*)machine);
 
@@ -575,8 +546,8 @@ void* xsBridgeCreateMachine(const XSBridgeCreation* c)
   bridge->machine = machine;
   /* mac_xs.c's fxCreateMachinePlatform — run inside xsCreateMachine, on this
   * thread — has already attached the worker-job and promise run-loop sources
-  * to the current run loop (this dedicated XS thread's loop). */
-  xsb_install_host(machine);
+  * to the current run loop (this dedicated XS thread's loop). The bridge
+  * installs no host functions — even print is consumer-supplied. */
   return machine;
 }
 
@@ -591,15 +562,12 @@ void xsBridgeDeleteMachine(void* machine)
   * worker jobs still queued. */
   xsDeleteMachine((xsMachine*)machine);
 
-  XSPending* p = bridge->pending;
+  XSMessage* p = bridge->messages;
   while (p) {
-    XSPending* n = p->next;
+    XSMessage* n = p->next;
     free(p);
     p = n;
   }
-  for (size_t i = 0; i < bridge->outputCount; i++)
-    free(bridge->outputs[i]);
-  free(bridge->outputs);
   free(bridge->moduleError);
   free(bridge);
 }
@@ -623,11 +591,11 @@ void* xsBridgeGetContext(void* bridge)
 
 /* Build a worker job and hand it to mac_xs.c's queue, which serializes the
  * enqueue under its worker mutex, signals the XS thread's run loop, and later
- * invokes xsb_job_perform there. Called from Swift background threads. */
-static void xsb_post(XSBridge* bridge, uint32_t id, int type, const char* json)
+ * invokes xsBridgeEventPerform there. Called from Swift background threads. */
+static void xsBridgeEventPost(XSBridge* bridge, uint32_t id, int type, const char* json)
 {
-    XSBJob* j = (XSBJob*)calloc(1, sizeof(XSBJob));
-    j->job.callback = xsb_job_perform;
+    XSEvent* j = (XSEvent*)calloc(1, sizeof(XSEvent));
+    j->job.callback = xsBridgeEventPerform;
     j->id = id;
     j->type = type;
     j->json = strdup(json ? json : "null");
@@ -636,12 +604,12 @@ static void xsb_post(XSBridge* bridge, uint32_t id, int type, const char* json)
 
 void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json)
 {
-    xsb_post((XSBridge*)bridge, id, XSB_TOKEN, json);
+    xsBridgeEventPost((XSBridge*)bridge, id, XSB_TOKEN, json);
 }
 
 void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json)
 {
-    xsb_post((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
+    xsBridgeEventPost((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
 }
 
 /* ---------------------------------------------------------------------------
@@ -652,7 +620,7 @@ int xsBridgePendingCount(void* machine)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     int n = 0;
-    for (XSPending* p = bridge->pending; p; p = p->next)
+    for (XSMessage* p = bridge->messages; p; p = p->next)
         n++;
     return n;
 }
@@ -673,20 +641,6 @@ void xsBridgeDebugCounts(void* machine, uint32_t* remembered, uint32_t* forgotte
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     if (remembered) *remembered = bridge->rememberCount;
     if (forgotten) *forgotten = bridge->forgetCount;
-}
-
-int xsBridgeOutputCount(void* machine)
-{
-    XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
-    return (int)bridge->outputCount;
-}
-
-const char* xsBridgeOutputAt(void* machine, int index)
-{
-    XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
-    if (index < 0 || index >= (int)bridge->outputCount)
-        return NULL;
-    return bridge->outputs[index];
 }
 
 /* ---------------------------------------------------------------------------
@@ -725,7 +679,7 @@ int xsBridgeEval(void* machine, const char* src, char** out_json, char** out_err
          * to its first await, or an already-resolved .then chain — so they run
          * within this eval instead of waiting for an async host completion that
          * a pure (host-call-free) agent never makes. */
-        xsb_drain_promises(the);
+        xsBridgeDrainPromises(the);
     }
     xsEndHost((xsMachine*)machine);
 

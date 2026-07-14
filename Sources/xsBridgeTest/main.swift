@@ -32,12 +32,13 @@ extension XSEngine {
         }
     }
 
-    /// Values passed to JS `print()`, in order.
+    /// Values passed to JS `print()` since the last install (capture lives in
+    /// xsBridgeTestC; written on the XS thread, so read there via withMachine).
     var outputs: [String] {
-        withMachine { machine in
-            let n = Int(xsBridgeOutputCount(machine))
+        withMachine { _ in
+            let n = Int(xsBridgeTestOutputCount())
             return (0..<n).compactMap {
-                xsBridgeOutputAt(machine, Int32($0)).map { String(cString: $0) }
+                xsBridgeTestOutputAt(Int32($0)).map { String(cString: $0) }
             }
         }
     }
