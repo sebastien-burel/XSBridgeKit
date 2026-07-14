@@ -1,23 +1,26 @@
 /*
  * bridge.c — the shim between Swift and the XS engine.
  *
- * The asynchronous bridge: a JS Promise is created on the JS side; __nativeCall
- * roots its resolve/reject (fxRemember), dispatches the request to Swift, and
- * Swift settles it later from a background queue by posting a worker job
- * (fxQueueWorkerJob, from the macOS platform port mac_xs.c). The job callback,
- * run on the XS thread, resolves/rejects, fxForgets, and drains promise jobs to
- * resume the awaiting JS continuation. mac_xs.c owns the run-loop integration
- * (worker-job queue + promise source); this file holds the host functions, the
- * pending-call bookkeeping, and the settlement logic.
+ * The asynchronous bridge: a consumer's C host function calls xsBridgePromise,
+ * which creates the JS Promise here (fxNewPromiseCapability), roots its
+ * resolve/reject (fxRemember) in a pending record, and returns an id. The host
+ * function hands (bridge, id) to Swift; Swift settles later from a background
+ * queue by posting a worker job (fxQueueWorkerJob, from the macOS platform
+ * port mac_xs.c). The job callback, run on the XS thread, resolves/rejects,
+ * fxForgets, and drains promise jobs to resume the awaiting JS continuation.
+ * mac_xs.c owns the run-loop integration (worker-job queue + promise source);
+ * this file holds the pending-call bookkeeping and the settlement logic.
  *
  * Invariants: XS is single-threaded (all machine access on the run-loop thread);
  * no xsSlot crosses into Swift (only opaque ids + UTF-8 JSON); every Swift->XS
  * entry is framed by xsBeginHost/xsEndHost with xsTry/xsCatch.
  */
 #include "xsAll.h"
+#include "xsScript.h"
 #include "xs.h"
 
 #include "bridge.h"
+#include "bridgeXS.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +79,7 @@ typedef struct XSBJob {
 
 typedef struct XSBridge {
     xsMachine* machine;
-    void* swiftContext;     /* opaque XSEngine pointer, for sync host.add */
+    void* swiftContext;     /* opaque Swift pointer (xsBridgeSet/GetContext) */
     uint32_t nextId;
     XSPending* pending;    /* XS-thread only */
 
@@ -86,89 +89,58 @@ typedef struct XSBridge {
     char** outputs;         /* captured print() output, XS-thread only */
     size_t outputCount;
     size_t outputCap;
+
+    int moduleStatus;       /* xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected */
+    char* moduleError;      /* rejection message (malloc'd), XS-thread only */
 } XSBridge;
 
-/* Implemented in Swift (@_cdecl), resolved at the final executable link.
- * Both route a (key, JSON params) to the consumer's HostBridge — the C layer
- * knows nothing about specific host capabilities (echo, tools, chat, …). */
-extern void xsb_dispatch(void* bridge, uint32_t id,
-                         const char* key, const char* json);
-extern char* xsb_dispatch_sync(void* bridge, const char* key, const char* json);
-
-/* Module loader hooks (Swift @_cdecl). find resolves a specifier (relative to
- * the importer) to a canonical id; load returns that id's source. Both return a
- * malloc'd UTF-8 string the C side frees, or NULL. */
-extern char* xsb_dispatch_find_module(void* bridge, const char* specifier,
-                                      const char* importer);
-extern char* xsb_dispatch_load_module(void* bridge, const char* id);
-
 static void xsb_job_perform(void* machine, void* job);
+static void xsb_drain_promises(txMachine* the);
 
 /* ---------------------------------------------------------------------------
- * Host functions — generic primitives only. The consumer installs its host.*
- * convenience wrappers (around __nativeCall / __nativeCallSync) via a prelude.
+ * Native-call entry — the one helper consumer C host functions need. The C
+ * layer knows nothing about specific host capabilities (echo, tools, chat, …):
+ * a consumer target installs its own host functions (xsNewHostFunction), each
+ * of which calls xsBridgePromise then hands (bridge, id, plain params) to its
+ * Swift @_cdecl counterpart.
  * ------------------------------------------------------------------------- */
 
-/* __nativeCall(key, params, resolve, reject[, onToken]) — the async entry.
- * Roots resolve/reject (+onToken), records the call by id, and posts it to Swift. */
-static void fx_native_call(xsMachine* the)
+/* Create the Promise for an in-flight native call: build a promise capability,
+ * copy resolve/reject (+ optional onToken) into stable C memory and root them
+ * BEFORE any further allocation (the stack temporaries keep them alive up to
+ * that point), link the pending record, set xsResult to the promise and return
+ * the id. Must run inside a host frame (a C host function). */
+uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext(the);
-
-    /* Root resolve/reject (and onToken, for streaming) BEFORE any allocation
-     * that could trigger GC, so the collector tracks (and relocates) these
-     * references. onToken lives for the whole call (the reverse channel). */
-    int argc = (int)xsToInteger(xsArgc);
     XSPending* rec = (XSPending*)calloc(1, sizeof(XSPending));
+    txSlot* resolveFunction;
+    txSlot* rejectFunction;
+
     rec->id = ++bridge->nextId;
-    rec->resolve = xsArg(2);
-    rec->reject = xsArg(3);
+
+    mxTemporary(resolveFunction);
+    mxTemporary(rejectFunction);
+    mxPush(mxPromiseConstructor);
+    fxNewPromiseCapability(the, resolveFunction, rejectFunction);
+    mxPullSlot(mxResult);
+    rec->resolve = *resolveFunction;
+    rec->reject = *rejectFunction;
     fxRemember(the, &rec->resolve);
     fxRemember(the, &rec->reject);
     bridge->rememberCount += 2;
-    if (argc > 4 && xsTypeOf(xsArg(4)) == xsReferenceType) {
-        rec->onToken = xsArg(4);
+    mxPop();
+    mxPop();
+
+    if (onToken) {
+        rec->onToken = *onToken;
         fxRemember(the, &rec->onToken);
         rec->hasOnToken = 1;
         bridge->rememberCount += 1;
     }
     rec->next = bridge->pending;
     bridge->pending = rec;
-
-    xsVars(1);
-    char* key = strdup(xsToString(xsArg(0)));
-    xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
-    xsResult = xsCall1(xsVar(0), xsID("stringify"), xsArg(1));
-    char* json = strdup(xsToString(xsResult));
-
-    /* Swift copies key/json synchronously, then works on a background queue. */
-    xsb_dispatch(bridge, rec->id, key, json);
-    free(key);
-    free(json);
-}
-
-/* __nativeCallSync(key, params) — synchronous JS -> Swift -> JS. Returns the
- * JSON result the host produced (parsed back into a JS value). */
-static void fx_native_call_sync(xsMachine* the)
-{
-    XSBridge* bridge = (XSBridge*)xsGetContext(the);
-    xsVars(1);
-    char* key = strdup(xsToString(xsArg(0)));
-    xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
-    xsResult = xsCall1(xsVar(0), xsID("stringify"), xsArg(1));
-    char* json = strdup(xsToString(xsResult));
-
-    char* result = xsb_dispatch_sync(bridge, key, json); /* malloc'd JSON or NULL */
-    free(key);
-    free(json);
-
-    if (result) {
-        xsVar(0) = xsGet(xsGlobal, xsID("JSON"));
-        xsResult = xsCall1(xsVar(0), xsID("parse"), xsString(result));
-        free(result);
-    } else {
-        xsResult = xsUndefined;
-    }
+    return rec->id;
 }
 
 static void xsb_capture_output(XSBridge* bridge, const char* s)
@@ -192,78 +164,290 @@ static void fx_print(xsMachine* the)
 
 static void xsb_install_host(xsMachine* machine)
 {
-    xsBeginHost(machine);
-    {
-        xsVars(2);
-        xsTry {
-            /* Empty host object; the consumer's prelude installs host.* methods. */
-            xsVar(0) = xsNewObject();
-            xsSet(xsGlobal, xsID("host"), xsVar(0));
-
-            xsVar(1) = xsNewHostFunction(fx_native_call, 4);
-            xsSet(xsGlobal, xsID("__nativeCall"), xsVar(1));
-
-            xsVar(1) = xsNewHostFunction(fx_native_call_sync, 2);
-            xsSet(xsGlobal, xsID("__nativeCallSync"), xsVar(1));
-
-            xsVar(1) = xsNewHostFunction(fx_print, 1);
-            xsSet(xsGlobal, xsID("print"), xsVar(1));
-        }
-        xsCatch {
-        }
+  xsBeginHost(machine);
+  {
+    xsVars(1);
+    xsTry {
+      xsVar(0) = xsNewHostFunction(fx_print, 1);
+      xsSet(xsGlobal, xsID("print"), xsVar(0));
     }
-    xsEndHost(machine);
+    xsCatch {
+    }
+  }
+  xsEndHost(machine);
 }
 
 /* ---------------------------------------------------------------------------
- * Module loader. mac_xs.h turns the XS default find/load module OFF, so we
- * supply both. Policy lives in Swift: fxFindModule asks the host to resolve a
- * specifier (relative to the importing module) to a canonical id; fxLoadModule
- * asks for that id's source, which we parse in memory as a Module (no
- * mxProgramFlag — so `import`/`export` are legal) and resolve. A NULL from
- * either surfaces to JS as a module-not-found rejection.
+ * Module loader — filesystem, the platform-port way (macos_xs.c / xst).
+ * mac_xs.h turns the XS default find/load module OFF, so we supply both.
+ * A module id is the realpath of its file. fxFindModule resolves `./`/`../`
+ * against the importing module's path (a relative specifier is invalid at the
+ * top level), recognizes `.js`/`.mjs` extensions (no extension guessing), and
+ * probes the file with realpath. fxLoadModule parses the file from disk as a
+ * Module (no mxProgramFlag). A miss surfaces to JS as module-not-found.
  * ------------------------------------------------------------------------- */
 
 txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
 {
-    XSBridge* bridge = (XSBridge*)xsGetContext(the);
-    char specifier[C_PATH_MAX];
-    fxToStringBuffer(the, slot, specifier, sizeof(specifier));
-    /* moduleID is the importer's id (XS_NO_ID for a top-level / dynamic import). */
-    const char* importer = (moduleID != XS_NO_ID) ? fxGetKeyName(the, moduleID) : NULL;
+    char name[C_PATH_MAX];
+    char buffer[C_PATH_MAX];
+    char real[C_PATH_MAX];
+    char extension[5] = "";
+    txInteger dot = 0;
+    txString slash;
+    txString path;
+    fxToStringBuffer(the, slot, name, sizeof(name));
+    if (name[0] == '.') {
+        if (name[1] == '/')
+            dot = 1;
+        else if ((name[1] == '.') && (name[2] == '/'))
+            dot = 2;
+    }
+    slash = c_strrchr(name, mxSeparator);
+    if (!slash)
+        slash = name;
+    slash = c_strrchr(slash, '.');
+    if (slash && (!c_strcmp(slash, ".js") || !c_strcmp(slash, ".mjs") || !c_strcmp(slash, ".xsb"))) {
+        c_strcpy(extension, slash);
+        *slash = 0;
+    }
+    if (dot) {
+        if (moduleID == XS_NO_ID)
+            return XS_NO_ID;
+        /* Prepend a separator so strrchr always finds one, then replace the
+         * importer's last component(s) with the relative specifier. */
+        buffer[0] = mxSeparator;
+        path = buffer + 1;
+        c_strcpy(path, fxGetKeyName(the, moduleID));
+        slash = c_strrchr(buffer, mxSeparator);
+        if (!slash)
+            return XS_NO_ID;
+        if (dot == 2) {
+            *slash = 0;
+            slash = c_strrchr(buffer, mxSeparator);
+            if (!slash)
+                return XS_NO_ID;
+        }
+        *slash = 0;
+        c_strcat(buffer, name + dot);
+    }
+    else
+        path = name;
+    c_strcat(path, extension);
+    if (c_realpath(path, real))
+        return fxNewNameC(the, real);
+    return XS_NO_ID;
+}
 
-    char* resolved = xsb_dispatch_find_module(bridge, specifier, importer);
-    if (!resolved)
-        return XS_NO_ID;
-    txID id = fxNewNameC(the, resolved);
-    free(resolved);
-    return id;
+/* Parse a script/module file with the XS parser (macos_xs.c pattern), source
+ * map indirection included. Returns NULL on any error (file missing, syntax). */
+static txScript* xsb_load_script(txMachine* the, txString path, txUnsigned flags)
+{
+    txParser _parser;
+    txParser* parser = &_parser;
+    txParserJump jump;
+    FILE* file = NULL;
+    txString name = NULL;
+    char map[C_PATH_MAX];
+    txScript* script = NULL;
+    fxInitializeParser(parser, the, the->parserBufferSize, the->parserTableModulo);
+    parser->firstJump = &jump;
+    file = fopen(path, "r");
+    if (c_setjmp(jump.jmp_buf) == 0) {
+        mxParserThrowElse(file);
+        parser->path = fxNewParserSymbol(parser, path);
+        fxParserTree(parser, file, (txGetter)fgetc, flags, &name);
+        fclose(file);
+        file = NULL;
+        if (name) {
+            txString slash = c_strrchr(path, mxSeparator);
+            if (slash) *slash = 0;
+            c_strcat(path, name);
+            mxParserThrowElse(c_realpath(path, map));
+            parser->path = fxNewParserSymbol(parser, map);
+            file = fopen(map, "r");
+            mxParserThrowElse(file);
+            fxParserSourceMap(parser, file, (txGetter)fgetc, flags, &name);
+            fclose(file);
+            file = NULL;
+            if (parser->errorCount == 0) {
+                if (slash) *slash = 0;
+                c_strcat(path, name);
+                mxParserThrowElse(c_realpath(path, map));
+                parser->path = fxNewParserSymbol(parser, map);
+            }
+        }
+        fxParserHoist(parser);
+        fxParserBind(parser);
+        script = fxParserCode(parser);
+    }
+    if (file)
+        fclose(file);
+    fxTerminateParser(parser);
+    return script;
+}
+
+/* ---------------------------------------------------------------------------
+ * Compiled modules (.xsb, produced by xsc) — reader modeled on the linker's
+ * fxNewLinkerScript (xslBase.c): big-endian atoms XS_B > VERS > SYMB > CODE
+ * [> HOST]. The engine does the rest: fxRunScript remaps the symbol table to
+ * machine ids (fxRemapScript) and frees the buffers (fxDeleteScript) — so the
+ * script struct and each buffer must be its own malloc'd block.
+ * ------------------------------------------------------------------------- */
+
+static int xsb_read_atom(FILE* file, txU4* size, txU4* type)
+{
+    txU1 b[8];
+    if (fread(b, 8, 1, file) != 1)
+        return 0;
+    *size = ((txU4)b[0] << 24) | ((txU4)b[1] << 16) | ((txU4)b[2] << 8) | b[3];
+    *type = ((txU4)b[4] << 24) | ((txU4)b[5] << 16) | ((txU4)b[6] << 8) | b[7];
+    return 1;
+}
+
+static txScript* xsb_read_binary(txString path)
+{
+    FILE* file = fopen(path, "rb");
+    txScript* script = NULL;
+    txU4 size, type;
+    const char* reason;
+
+    reason = "cannot open";
+    if (!file)
+        goto bail;
+    script = (txScript*)calloc(1, sizeof(txScript));
+
+    reason = "bad signature";
+    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_BINARY)
+        goto bail;
+    reason = "bad version atom";
+    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_VERSION
+        || size != 8 + sizeof(script->version)
+        || fread(script->version, sizeof(script->version), 1, file) != 1)
+        goto bail;
+    reason = "XS version mismatch";
+    if ((script->version[0] != XS_MAJOR_VERSION)
+        || (script->version[1] != XS_MINOR_VERSION))
+        goto bail;
+    reason = "compiled with errors";
+    if (script->version[3] == 1)
+        goto bail;
+    reason = "host functions not supported";
+    if (script->version[3] == -1)
+        goto bail;
+
+    reason = "bad symbols atom";
+    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_SYMBOLS || size <= 8)
+        goto bail;
+    script->symbolsSize = (txSize)(size - 8);
+    script->symbolsBuffer = (txByte*)malloc(script->symbolsSize);
+    if (fread(script->symbolsBuffer, script->symbolsSize, 1, file) != 1)
+        goto bail;
+
+    reason = "bad code atom";
+    if (!xsb_read_atom(file, &size, &type) || type != XS_ATOM_CODE || size <= 8)
+        goto bail;
+    script->codeSize = (txSize)(size - 8);
+    script->codeBuffer = (txByte*)malloc(script->codeSize);
+    if (fread(script->codeBuffer, script->codeSize, 1, file) != 1)
+        goto bail;
+
+    fclose(file);
+    return script;
+
+bail:
+    fprintf(stderr, "xsb: %s (%s)\n", reason, path);
+    if (file)
+        fclose(file);
+    fxDeleteScript(script);
+    return NULL;
 }
 
 void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
 {
-    XSBridge* bridge = (XSBridge*)xsGetContext(the);
-    const char* id = fxGetKeyName(the, moduleID);
-
-    char* source = xsb_dispatch_load_module(bridge, id);
-    if (!source)
-        return;   /* module stays unresolved -> JS "module not found" */
-
-    txUnsigned flags = 0;   /* Module goal; a Script would set mxProgramFlag. */
-    size_t len = c_strlen(id);
-    if (len >= 5 && c_strcmp(id + (len - 5), ".json") == 0)
-        flags |= mxJSONModuleFlag;
-
-    /* fxParseScript catches its own parse jump and returns NULL on a syntax
-     * error (no longjmp), so freeing source right after is always safe. */
-    txStringCStream stream;
-    stream.buffer = source;
-    stream.offset = 0;
-    stream.size = (txSize)c_strlen(source);
-    txScript* script = fxParseScript(the, &stream, fxStringCGetter, flags);
-    free(source);
+    txString path = fxGetKeyName(the, moduleID);
+    txSize length = mxStringLength(path);
+    txScript* script;
+    if ((length > 4) && !c_strcmp(path + length - 4, ".xsb"))
+        script = xsb_read_binary(path);
+    else {
+#ifdef mxDebug
+        txUnsigned flags = mxDebugFlag;
+#else
+        txUnsigned flags = 0;
+#endif
+        script = xsb_load_script(the, path, flags);
+    }
     if (script)
         fxResolveModule(the, module, moduleID, script, C_NULL, C_NULL);
+}
+
+/* ---------------------------------------------------------------------------
+ * Run a module file — the xst way (xst.c:fxRunModuleFile): dynamic-import the
+ * path, attach then(fulfilled, rejected) host functions that record the
+ * outcome in the bridge, and drain promise jobs so a module with no async work
+ * is settled on return. A module still awaiting host calls settles later on
+ * the run loop; poll xsBridgeModuleStatus once idle.
+ * ------------------------------------------------------------------------- */
+
+static void xsb_module_fulfilled(xsMachine* the)
+{
+  XSBridge* bridge = (XSBridge*)xsGetContext(the);
+  bridge->moduleStatus = 1;
+}
+
+static void xsb_module_rejected(xsMachine* the)
+{
+  XSBridge* bridge = (XSBridge*)xsGetContext(the);
+  bridge->moduleStatus = 2;
+  free(bridge->moduleError);
+  bridge->moduleError = NULL;
+  xsTry {
+    bridge->moduleError = strdup(xsToString(xsArg(0)));
+  }
+  xsCatch {
+    bridge->moduleError = strdup("module rejected");
+  }
+}
+
+void xsBridgeRunModule(void* machine, const char* path)
+{
+  xsMachine* the = (xsMachine*)machine;
+  XSBridge* bridge = (XSBridge*)xsGetContext(the);
+  bridge->moduleStatus = 0;
+  free(bridge->moduleError);
+  bridge->moduleError = NULL;
+
+  xsBeginHost(the);
+  {
+    xsTry {
+      txSlot* realm = mxProgram.value.reference->next->value.module.realm;
+      mxPushStringC((txString)path);
+      mxPushUndefined();
+      fxRunImport(the, realm, C_NULL);
+      mxDub();
+      fxGetID(the, mxID(_then));
+      mxCall();
+      fxNewHostFunction(the, xsb_module_fulfilled, 1, XS_NO_ID, XS_NO_ID);
+      fxNewHostFunction(the, xsb_module_rejected, 1, XS_NO_ID, XS_NO_ID);
+      mxRunCount(2);
+      mxPop();
+    }
+    xsCatch {
+      bridge->moduleStatus = 2;
+      free(bridge->moduleError);
+      bridge->moduleError = strdup(xsToString(xsException));
+    }
+    xsb_drain_promises(the);
+  }
+  xsEndHost(the);
+}
+
+int xsBridgeModuleStatus(void* machine, char** out_err)
+{
+  XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
+  if (out_err) *out_err = (bridge->moduleStatus == 2 && bridge->moduleError) ? strdup(bridge->moduleError) : NULL;
+  return bridge->moduleStatus;
 }
 
 /* ---------------------------------------------------------------------------
@@ -365,69 +549,72 @@ static void xsb_job_perform(void* machine, void* job_)
  * Machine lifecycle.
  * ------------------------------------------------------------------------- */
 
-void* xsb_create_machine(void)
+void* xsBridgeCreateMachine(const XSBridgeCreation* c)
 {
-    xsCreation creation = {
-        16 * 1024 * 1024,   /* initialChunkSize */
-        16 * 1024 * 1024,   /* incrementalChunkSize */
-        1 * 1024 * 1024,    /* initialHeapCount */
-        1 * 1024 * 1024,    /* incrementalHeapCount */
-        256 * 1024,         /* stackCount */
-        1024,               /* initialKeyCount */
-        1024,               /* incrementalKeyCount */
-        1993,               /* nameModulo */
-        127,                /* symbolModulo */
-        64 * 1024,          /* parserBufferSize */
-        1993,               /* parserTableModulo */
-    };
+  xsCreation creation = {
+    c->initialChunkSize,
+    c->incrementalChunkSize,
+    c->initialHeapCount,
+    c->incrementalHeapCount,
+    c->stackCount,
+    c->initialKeyCount,
+    c->incrementalKeyCount,
+    c->nameModulo,
+    c->symbolModulo,
+    c->parserBufferSize,
+    c->parserTableModulo,
+    /* staticSize, nativeStackSize: 0 (unused by this build) */
+  };
 
-    XSBridge* bridge = (XSBridge*)calloc(1, sizeof(XSBridge));
-    xsMachine* machine = xsCreateMachine(&creation, "XSBridge", bridge);
-    if (!machine) {
-        free(bridge);
-        return NULL;
-    }
-    bridge->machine = machine;
-    /* mac_xs.c's fxCreateMachinePlatform — run inside xsCreateMachine, on this
-     * thread — has already attached the worker-job and promise run-loop sources
-     * to the current run loop (this dedicated XS thread's loop). */
-    xsb_install_host(machine);
-    return machine;
-}
-
-void xsb_delete_machine(void* machine)
-{
-    if (!machine)
-        return;
-    XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
-    /* xsDeleteMachine runs mac_xs.c's fxDeleteMachinePlatform, which tears down
-     * the worker/promise run-loop sources, the worker mutex, and frees any
-     * worker jobs still queued. */
-    xsDeleteMachine((xsMachine*)machine);
-
-    XSPending* p = bridge->pending;
-    while (p) {
-        XSPending* n = p->next;
-        free(p);
-        p = n;
-    }
-    for (size_t i = 0; i < bridge->outputCount; i++)
-        free(bridge->outputs[i]);
-    free(bridge->outputs);
+  XSBridge* bridge = (XSBridge*)calloc(1, sizeof(XSBridge));
+  xsMachine* machine = xsCreateMachine(&creation, "XSBridge", bridge);
+  if (!machine) {
     free(bridge);
+    return NULL;
+  }
+  bridge->machine = machine;
+  /* mac_xs.c's fxCreateMachinePlatform — run inside xsCreateMachine, on this
+  * thread — has already attached the worker-job and promise run-loop sources
+  * to the current run loop (this dedicated XS thread's loop). */
+  xsb_install_host(machine);
+  return machine;
 }
 
-void xsb_set_context(void* machine, void* context)
+void xsBridgeDeleteMachine(void* machine)
 {
-    XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
-    bridge->swiftContext = context;
+  if (!machine)
+    return;
+  XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
+
+  /* xsDeleteMachine runs mac_xs.c's fxDeleteMachinePlatform, which tears down
+  * the worker/promise run-loop sources, the worker mutex, and frees any
+  * worker jobs still queued. */
+  xsDeleteMachine((xsMachine*)machine);
+
+  XSPending* p = bridge->pending;
+  while (p) {
+    XSPending* n = p->next;
+    free(p);
+    p = n;
+  }
+  for (size_t i = 0; i < bridge->outputCount; i++)
+    free(bridge->outputs[i]);
+  free(bridge->outputs);
+  free(bridge->moduleError);
+  free(bridge);
+}
+
+void xsBridgeSetContext(void* machine, void* context)
+{
+  XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
+  bridge->swiftContext = context;
 }
 
 /* The opaque Swift context, recovered from the bridge pointer that the async
  * dispatch callbacks receive (so they can find the owning engine/HostBridge). */
-void* xsb_context_of(void* bridge)
+void* xsBridgeGetContext(void* bridge)
 {
-    return ((XSBridge*)bridge)->swiftContext;
+  return ((XSBridge*)bridge)->swiftContext;
 }
 
 /* ---------------------------------------------------------------------------
@@ -447,12 +634,12 @@ static void xsb_post(XSBridge* bridge, uint32_t id, int type, const char* json)
     fxQueueWorkerJob(bridge->machine, j);
 }
 
-void xsb_emit_token(void* bridge, uint32_t id, const char* json)
+void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json)
 {
     xsb_post((XSBridge*)bridge, id, XSB_TOKEN, json);
 }
 
-void xsb_complete(void* bridge, uint32_t id, int success, const char* json)
+void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json)
 {
     xsb_post((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
 }
@@ -461,7 +648,7 @@ void xsb_complete(void* bridge, uint32_t id, int success, const char* json)
  * Introspection for the harness.
  * ------------------------------------------------------------------------- */
 
-int xsb_pending_count(void* machine)
+int xsBridgePendingCount(void* machine)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     int n = 0;
@@ -472,7 +659,7 @@ int xsb_pending_count(void* machine)
 
 /* Force a full garbage collection on the XS thread. Used by the stress test to
  * prove that in-flight resolve/reject/onToken roots survive collection. */
-void xsb_collect_garbage(void* machine)
+void xsBridgeCollectGarbage(void* machine)
 {
     xsBeginHost((xsMachine*)machine);
     {
@@ -481,20 +668,20 @@ void xsb_collect_garbage(void* machine)
     xsEndHost((xsMachine*)machine);
 }
 
-void xsb_debug_counts(void* machine, uint32_t* remembered, uint32_t* forgotten)
+void xsBridgeDebugCounts(void* machine, uint32_t* remembered, uint32_t* forgotten)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     if (remembered) *remembered = bridge->rememberCount;
     if (forgotten) *forgotten = bridge->forgetCount;
 }
 
-int xsb_output_count(void* machine)
+int xsBridgeOutputCount(void* machine)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     return (int)bridge->outputCount;
 }
 
-const char* xsb_output_at(void* machine, int index)
+const char* xsBridgeOutputAt(void* machine, int index)
 {
     XSBridge* bridge = (XSBridge*)xsGetContext((xsMachine*)machine);
     if (index < 0 || index >= (int)bridge->outputCount)
@@ -503,20 +690,15 @@ const char* xsb_output_at(void* machine, int index)
 }
 
 /* ---------------------------------------------------------------------------
- * Phase 0-1 entry points.
+ * Eval.
  * ------------------------------------------------------------------------- */
 
-int32_t xsb_smoke(void)
-{
-    return 42;
-}
-
-void xsb_free(char* s)
+void xsBridgeFree(char* s)
 {
     free(s);
 }
 
-int xsb_eval(void* machine, const char* src, char** out_json, char** out_err)
+int xsBridgeEval(void* machine, const char* src, char** out_json, char** out_err)
 {
     int ok = 0;
     *out_json = NULL;

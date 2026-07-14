@@ -12,12 +12,11 @@ let xsDefines: [CSetting] = [
   .define("mxStringInfoCacheLength", to: "4"),
 ]
 
-let headerPaths: [CSetting] = [
-    .headerSearchPath("xs/sources"),
-    .headerSearchPath("xs/includes"),
-    .headerSearchPath("xs/platforms"),
-    .headerSearchPath("xs/tools"),
-]
+// Header search paths are relative to each target's directory, so consumer C
+// targets (host functions) reach the XS tree through the ../XSBridge prefix.
+let xsHeaderDirs = ["xs/sources", "xs/includes", "xs/platforms", "xs/tools"]
+let headerPaths: [CSetting] = xsHeaderDirs.map { .headerSearchPath($0) }
+let consumerHeaderPaths: [CSetting] = xsHeaderDirs.map { .headerSearchPath("../XSBridge/" + $0) }
 
 let package = Package(
     name: "XSBridge",
@@ -40,15 +39,33 @@ let package = Package(
                 .linkedFramework("CoreFoundation"),
             ]
         ),
-        // Swift layer: XSEngine + HostBridge protocol + the @_cdecl callbacks.
+        // Swift layer: XSEngine (dedicated thread + CFRunLoop per machine).
         .target(
             name: "XSBridgeKit",
             dependencies: ["XSBridge"]
         ),
+        // C side of the demo host: host.echo/stream/fail/add written against
+        // xs.h. Same defines as XSBridge — the txMachine ABI depends on them.
+        .target(
+            name: "xsBridgeTestC",
+            // XSBridge dependency exposes its public headers (bridge.h).
+            dependencies: ["XSBridge"],
+            cSettings: consumerHeaderPaths + xsDefines
+        ),
         // Test harness / demo (the 6-phase regression suite).
         .executableTarget(
             name: "xsBridgeTest",
-            dependencies: ["XSBridgeKit", "XSBridge"]
+            dependencies: ["XSBridgeKit", "XSBridge", "xsBridgeTestC"]
+        ),
+        // C side of the CLI sandbox: host functions written against xs.h.
+        .target(
+            name: "xsBridgeCliC",
+            dependencies: ["XSBridge"],
+            cSettings: consumerHeaderPaths + xsDefines
+        ),
+        .executableTarget(
+            name: "xsBridgeCli",
+            dependencies: ["XSBridgeKit", "XSBridge", "xsBridgeCliC"]
         ),
     ]
 )

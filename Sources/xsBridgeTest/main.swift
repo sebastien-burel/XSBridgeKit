@@ -2,12 +2,56 @@
 // Runs each phase's criteria, prints "PHASE n: PASS|FAIL", and exits non-zero
 // if any criterion fails (usable in CI / non-interactive runs — PLAN annex).
 
-import XSBridge      // C module — for xsb_smoke() in Phase 0
+import XSBridge      // C module — GC/leak/print introspection (test-only)
 import XSBridgeKit   // Swift API — XSEngine
+import XSBridgeTestC // C side of the demo host (installs host.*)
 import Darwin
 import Foundation
 
+// Test instrumentation over the flat C API — not part of the consumer surface
+// of XSBridgeKit, so it lives here, built on withMachine + pendingCount.
+extension XSEngine {
+    /// Like runUntilIdle, but forces a full GC on the XS thread every turn —
+    /// stresses the rooting of in-flight resolve/reject/onToken slots (Phase 5).
+    func runUntilIdleForcingGC(timeout: TimeInterval = 60) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while pendingCount > 0 {
+            withMachine { xsBridgeCollectGarbage($0) }
+            if Date() > deadline { break }
+            usleep(2_000)
+        }
+    }
+
+    /// (remembered, forgotten) — equal when idle if no slot leaked.
+    var rememberForgetCounts: (UInt32, UInt32) {
+        withMachine {
+            var remembered: UInt32 = 0
+            var forgotten: UInt32 = 0
+            xsBridgeDebugCounts($0, &remembered, &forgotten)
+            return (remembered, forgotten)
+        }
+    }
+
+    /// Values passed to JS `print()`, in order.
+    var outputs: [String] {
+        withMachine { machine in
+            let n = Int(xsBridgeOutputCount(machine))
+            return (0..<n).compactMap {
+                xsBridgeOutputAt(machine, Int32($0)).map { String(cString: $0) }
+            }
+        }
+    }
+}
+
 var failures = 0
+
+/// A fresh engine with the demo host functions installed (CLI-style: the C
+/// target registers host.echo/stream/fail/add, which call back into Swift).
+func makeEngine() -> XSEngine? {
+    guard let engine = XSEngine() else { return nil }
+    engine.withMachine { xsBridgeTestInstall($0) }
+    return engine
+}
 
 func check(_ label: String, _ condition: Bool) {
     print("  [\(condition ? "ok" : "XX")] \(label)")
@@ -32,20 +76,12 @@ func residentBytes() -> UInt64 {
     return kr == KERN_SUCCESS ? info.resident_size : 0
 }
 
-// ---- Phase 0: smoke ----
-do {
-    let before = failures
-    print("PHASE 0 — smoke")
-    check("xsb_smoke() == 42", xsb_smoke() == 42)
-    phaseResult(0, before)
-}
-
 // ---- Phase 1: machine lifecycle + synchronous eval ----
 do {
     let before = failures
     print("PHASE 1 — machine lifecycle + sync eval")
 
-    guard let engine = XSEngine(host: DemoHost()) else {
+    guard let engine = makeEngine() else {
         check("create machine", false)
         phaseResult(1, before)
         exit(1)
@@ -76,9 +112,9 @@ do {
     let iters = ProcessInfo.processInfo.environment["XSB_MACHINE_ITERS"].flatMap { Int($0) } ?? 1000
 
     func cycle() -> Bool {
-        guard let e = XSEngine(host: DemoHost()) else { return false }
+        guard let e = makeEngine() else { return false }
         return (try? e.eval("({a:1,b:2})")) != nil
-        // e released here -> xsb_delete_machine
+        // e released here -> xsBridgeDeleteMachine
     }
 
     // Warm up so the one-time high-water marks are established before measuring:
@@ -125,16 +161,16 @@ do {
     let before = failures
     print("PHASE 2 — synchronous host function (JS -> Swift)")
 
-    let demo = DemoHost()
-    guard let engine = XSEngine(host: demo) else {
+    guard let engine = makeEngine() else {
         check("create machine", false)
         phaseResult(2, before)
         exit(1)
     }
 
+    DemoHost.syncCallCount = 0
     let result = try? engine.eval("host.add(2, 3)")
     check("host.add(2, 3) == 5", result == "5")
-    check("Swift host call executed (count == 1)", demo.syncCallCount == 1)
+    check("Swift host call executed (count == 1)", DemoHost.syncCallCount == 1)
 
     phaseResult(2, before)
 }
@@ -145,7 +181,7 @@ do {
     print("PHASE 3 — async bridge (echo)")
 
     // Test A: load agents/echo.js — `const r = await host.echo("hi"); print(r)`.
-    if let engine = XSEngine(host: DemoHost()) {
+    if let engine = makeEngine() {
         let path = "agents/echo.js"
         if let src = try? String(contentsOfFile: path, encoding: .utf8) {
             _ = try? engine.eval(src)
@@ -161,7 +197,7 @@ do {
     }
 
     // Test B: 100 sequential echoes — all correct, no leak.
-    if let engine = XSEngine(host: DemoHost()) {
+    if let engine = makeEngine() {
         let n = 100
         let agent = """
         (async () => {
@@ -194,7 +230,7 @@ do {
     let before = failures
     print("PHASE 4 — streaming (reverse channel)")
 
-    if let engine = XSEngine(host: DemoHost()) {
+    if let engine = makeEngine() {
         let path = "agents/stream.js"
         if let src = try? String(contentsOfFile: path, encoding: .utf8) {
             _ = try? engine.eval(src)
@@ -240,7 +276,7 @@ do {
     }
 
     // Concurrent: Promise.all of several in-flight echoes, no id crosstalk.
-    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("concurrent.js") {
+    if let engine = makeEngine(), let src = loadAgent("concurrent.js") {
         _ = try? engine.eval(src)
         engine.runUntilIdle()
         check("concurrent Promise.all preserves results", engine.outputs == ["all:a,b,c,d"])
@@ -250,7 +286,7 @@ do {
     }
 
     // Reject path: host.fail() -> Swift reject -> JS catch, no escape to Swift.
-    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("error.js") {
+    if let engine = makeEngine(), let src = loadAgent("error.js") {
         _ = try? engine.eval(src)
         engine.runUntilIdle()
         check("reject surfaces in JS catch", engine.outputs == ["caught:deliberate failure"])
@@ -260,7 +296,7 @@ do {
     }
 
     // Mixed sequential agent: echo then stream, distinct ids, no crosstalk.
-    if let engine = XSEngine(host: DemoHost()), let src = loadAgent("sequential.js") {
+    if let engine = makeEngine(), let src = loadAgent("sequential.js") {
         _ = try? engine.eval(src)
         engine.runUntilIdle()
         let expected = ["echo:first", "delta:Hello", "delta: ", "delta:from",
@@ -272,7 +308,7 @@ do {
     }
 
     // Stress: >= 5000 calls, batches in flight, forced GC between turns.
-    if let engine = XSEngine(host: DemoHost()) {
+    if let engine = makeEngine() {
         let batches = 100, perBatch = 50  // 5000 calls
         let agent = """
         (async () => {
@@ -318,13 +354,14 @@ do {
     let before = failures
     print("PHASE 6 — ES module loader")
 
-    if let engine = XSEngine(host: DemoHost()) {
-        // Dynamic import resolves through the host loader; the imported module
-        // itself uses a static `import ... from` (module goal), so a green here
-        // proves both the loader wiring and module-goal parsing.
+    if let engine = makeEngine() {
+        // Dynamic import resolves through the filesystem loader (cwd-relative,
+        // explicit extension); the imported module itself uses a static
+        // `import ... from './…'` (module goal, importer-relative), so a green
+        // here proves both the loader wiring and module-goal parsing.
         _ = try? engine.eval("""
             globalThis.__m = 'pending';
-            import('reexport')
+            import('agents/modules/reexport.js')
               .then(function (m) { globalThis.__m = 'ok:' + m.doubled; })
               .catch(function (e) { globalThis.__m = 'err:' + String(e); });
             """)

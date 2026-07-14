@@ -1,69 +1,102 @@
 /*
  * bridge.h — flat C API exposed to Swift.
  *
- * Invariant (PLAN §40.2): nothing XS-specific crosses this header. Swift only
- * ever sees plain C types — an opaque machine handle (void*), opaque ids
- * (uint32_t), C strings (UTF-8 JSON). No xsSlot, no xsMachine, no XS macros.
+ * Invariant (PLAN §40.2): nothing XS-specific crosses this header to Swift.
+ * Swift only ever sees plain C types — an opaque machine handle (void*),
+ * opaque ids (uint32_t), C strings (UTF-8 JSON). No xsSlot, no xsMachine,
+ * no XS macros (those live in bridgeXS.h, for consumer C targets only).
  */
 #ifndef XSB_BRIDGE_H
 #define XSB_BRIDGE_H
 
 #include <stdint.h>
 
-/* Phase 0 smoke test: returns 42, proves the C target links into Swift. */
-int32_t xsb_smoke(void);
-
 /* ---- Machine lifecycle ---- */
 
-/* Create a full XS machine (engine with parser) plus its async bridge and a
- * CFRunLoopSource on the *current* run loop. Returns an opaque handle or NULL. */
-void* xsb_create_machine(void);
+/* VM sizing handed to xsCreateMachine — a flat mirror of the fields of
+ * xsCreation (xs.h) that the bridge sets; the defaults live in Swift
+ * (XSCreation, XSEngine.swift). */
+typedef struct {
+  int32_t initialChunkSize;
+  int32_t incrementalChunkSize;
+  int32_t initialHeapCount;
+  int32_t incrementalHeapCount;
+  int32_t stackCount;
+  int32_t initialKeyCount;
+  int32_t incrementalKeyCount;
+  int32_t nameModulo;
+  int32_t symbolModulo;
+  int32_t parserBufferSize;
+  int32_t parserTableModulo;
+} XSBridgeCreation;
+
+/* Create a full XS machine (engine with parser) sized by `creation`, plus its
+ * async bridge and a CFRunLoopSource on the *current* run loop. Returns an
+ * opaque handle or NULL. */
+void* xsBridgeCreateMachine(const XSBridgeCreation* creation);
 
 /* Destroy a machine and its bridge. Caller must ensure no async work is still
  * in flight (no pending ids) before deleting. */
-void xsb_delete_machine(void* machine);
+void xsBridgeDeleteMachine(void* machine);
 
-/* Set the opaque Swift engine pointer recovered by host dispatch callbacks. */
-void xsb_set_context(void* machine, void* context);
+/* Set the opaque Swift context pointer recovered by xsBridgeGetContext. */
+void xsBridgeSetContext(void* machine, void* context);
 
-/* Recover the opaque Swift context from the bridge pointer passed to the async
- * dispatch callbacks (xsb_dispatch / xsb_dispatch_sync). */
-void* xsb_context_of(void* bridge);
+/* Recover the opaque Swift context from the bridge pointer that C host
+ * functions obtain via xsGetContext(the) and hand to Swift. */
+void* xsBridgeGetContext(void* bridge);
 
-/* ---- Synchronous eval (Phase 1) ---- */
+/* ---- Synchronous eval ---- */
 
 /* Evaluate `src`. On success returns 1, *out_json = JSON result (or "undefined").
  * On JS error returns 0, *out_err = the message. Free returned strings with
- * xsb_free. A JS exception is captured here and never crosses into Swift. */
-int xsb_eval(void* machine, const char* src, char** out_json, char** out_err);
+ * xsBridgeFree. A JS exception is captured here and never crosses into Swift. */
+int xsBridgeEval(void* machine, const char* src, char** out_json, char** out_err);
 
-/* Free a string returned by xsb_eval. */
-void xsb_free(char* s);
+/* Free a string returned by this API. */
+void xsBridgeFree(char* s);
 
-/* ---- Async bridge (Phase 3) ---- */
+/* ---- ES module runner ---- */
 
-/* Called from a Swift background thread to settle an in-flight async call by id.
- * `success` non-zero -> resolve(JSON.parse(json)); zero -> reject(...). The
- * result is queued and the machine's run loop is woken to settle on its own
- * thread. Thread-safe. */
-void xsb_complete(void* bridge, uint32_t id, int success, const char* json);
+/* Import the ES module file at `path` (absolute, or relative to cwd; between
+ * modules `./`/`../` resolve against the importer; extensions are explicit —
+ * `.js`/`.mjs`). Starts the import and drains promise jobs; a module awaiting
+ * async host work settles later on the run loop. XS-thread only. */
+void xsBridgeRunModule(void* machine, const char* path);
 
-/* Called from a Swift background thread to stream one token (the reverse
- * channel): invokes the JS onToken(JSON.parse(json)) and keeps the call open
- * until a later xsb_complete settles it. Thread-safe. */
-void xsb_emit_token(void* bridge, uint32_t id, const char* json);
+/* Outcome of the last xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected.
+ * When rejected, *out_err = the message (free with xsBridgeFree). XS-thread only. */
+int xsBridgeModuleStatus(void* machine, char** out_err);
+
+/* ---- Async settlement (from Swift background threads) ---- */
+
+/* Settle an in-flight native call by id. `success` non-zero ->
+ * resolve(JSON.parse(json)); zero -> reject(...). The result is queued and the
+ * machine's run loop is woken to settle on its own thread. Thread-safe. */
+void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json);
+
+/* Stream one token (the reverse channel): invokes the call's JS
+ * onToken(JSON.parse(json)) and keeps the call open until a later
+ * xsBridgeComplete settles it. Thread-safe. */
+void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json);
+
+/* ---- Introspection ---- */
 
 /* Number of in-flight async calls (ids awaiting settlement). XS-thread only. */
-int xsb_pending_count(void* machine);
+int xsBridgePendingCount(void* machine);
 
 /* Force a full GC on the XS thread (stress test: verifies roots survive). */
-void xsb_collect_garbage(void* machine);
+void xsBridgeCollectGarbage(void* machine);
 
 /* Leak accounting: total xsRemember vs xsForget calls (must match when idle). */
-void xsb_debug_counts(void* machine, uint32_t* remembered, uint32_t* forgotten);
+void xsBridgeDebugCounts(void* machine, uint32_t* remembered, uint32_t* forgotten);
 
 /* Captured print() output. */
-int xsb_output_count(void* machine);
-const char* xsb_output_at(void* machine, int index);
+int xsBridgeOutputCount(void* machine);
+const char* xsBridgeOutputAt(void* machine, int index);
+
+/* The XS-typed helpers for consumer C host-function targets (xsBridgePromise)
+ * live in bridgeXS.h, which is NOT part of the clang module — include it
+ * textually after xs.h in C translation units only. */
 
 #endif /* XSB_BRIDGE_H */
