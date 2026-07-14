@@ -146,10 +146,17 @@ public final class XSEngine {
   /// `./`/`../` between modules resolve against the importer, extensions are
   /// explicit). If the module has a callable `default` export, it is invoked
   /// on every run — the body evaluates only once (module cache), the default
-  /// is the repeatable entry. Waits until settled (top-level await and the
-  /// default's result included) and throws XSError if the run rejects.
-  public func runModule(_ path: String, timeout: TimeInterval = 5) throws {
-    loop.sync { xsBridgeRunModule(self.machine, path) }
+  /// is the repeatable entry — and receives `JSON.parse(params)` when params
+  /// are given. Waits until settled (top-level await and the default's result
+  /// included) and throws XSError if the run rejects.
+  public func runModule(_ path: String, params: String? = nil, timeout: TimeInterval = 5) throws {
+    loop.sync {
+      if let params {
+        params.withCString { xsBridgeRunModule(self.machine, path, $0) }
+      } else {
+        xsBridgeRunModule(self.machine, path, nil)
+      }
+    }
     runUntilIdle(timeout: timeout)
     let error: String? = loop.sync {
       var err: UnsafeMutablePointer<CChar>?

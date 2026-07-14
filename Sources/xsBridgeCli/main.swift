@@ -34,9 +34,20 @@ do {
     // argv[1...] = fichiers JS, exécutés en séquence comme modules ES sur la
     // même machine (chargés par fxFindModule/fxLoadModule côté C — imports
     // relatifs contre l'importeur, extensions explicites, top-level await ;
-    // cache de modules partagé entre les runs). Throw si un module rejette.
-    for path in CommandLine.arguments.dropFirst() {
-      try engine.runModule(path)
+    // cache de modules partagé entre les runs). Un argument qui n'est pas un
+    // fichier existant est le JSON de paramètres du module qui le précède
+    // (passé à son export default via JSON.parse). Throw si un module rejette.
+    let args = Array(CommandLine.arguments.dropFirst())
+    var i = 0
+    while i < args.count {
+      let path = args[i]
+      var params: String? = nil
+      if i + 1 < args.count, !FileManager.default.fileExists(atPath: args[i + 1]) {
+        params = args[i + 1]
+        i += 1
+      }
+      try engine.runModule(path, params: params)
+      i += 1
     }
   }
   else {

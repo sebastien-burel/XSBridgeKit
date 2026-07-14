@@ -88,6 +88,7 @@ typedef struct XSBridge {
 
     int moduleStatus;       /* xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected */
     char* moduleError;      /* rejection message (malloc'd), XS-thread only */
+    char* moduleParams;     /* JSON for the default export (malloc'd or NULL) */
 } XSBridge;
 
 static void xsBridgeEventPerform(void* machine, void* job);
@@ -384,7 +385,14 @@ static void xsBridgeModuleFulfilled(xsMachine* the)
     if (xsTypeOf(xsArg(0)) == xsReferenceType) {
       xsVar(0) = xsGet(xsArg(0), xsID("default"));
       if (fxIsCallable(the, &xsVar(0))) {
-        xsVar(1) = xsCallFunction0(xsVar(0), xsUndefined);
+        if (bridge->moduleParams) {
+          /* default(JSON.parse(params)) — a parse error rejects the run. */
+          xsVar(1) = xsCall1(xsGet(xsGlobal, xsID("JSON")), xsID("parse"),
+                             xsString(bridge->moduleParams));
+          xsVar(1) = xsCallFunction1(xsVar(0), xsUndefined, xsVar(1));
+        }
+        else
+          xsVar(1) = xsCallFunction0(xsVar(0), xsUndefined);
         /* Settle the run with the default's result, sync or async alike. */
         xsVar(1) = xsCall1(xsGet(xsGlobal, xsID("Promise")), xsID("resolve"), xsVar(1));
         xsVar(1) = xsCall2(xsVar(1), xsID("then"),
@@ -418,13 +426,15 @@ static void xsBridgeModuleRejected(xsMachine* the)
   }
 }
 
-void xsBridgeRunModule(void* machine, const char* path)
+void xsBridgeRunModule(void* machine, const char* path, const char* paramsJSON)
 {
   xsMachine* the = (xsMachine*)machine;
   XSBridge* bridge = (XSBridge*)xsGetContext(the);
   bridge->moduleStatus = 0;
   free(bridge->moduleError);
   bridge->moduleError = NULL;
+  free(bridge->moduleParams);
+  bridge->moduleParams = paramsJSON ? strdup(paramsJSON) : NULL;
 
   xsBeginHost(the);
   {
@@ -606,6 +616,7 @@ void xsBridgeDeleteMachine(void* machine)
     p = n;
   }
   free(bridge->moduleError);
+  free(bridge->moduleParams);
   free(bridge);
 }
 

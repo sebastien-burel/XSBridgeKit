@@ -62,10 +62,12 @@ void xsBridgeFree(char* s);
  * modules `./`/`../` resolve against the importer; extensions are explicit —
  * `.js`/`.mjs`/`.xsb`). If the module has a callable `default` export it is
  * invoked on every run (the body evaluates only once — module cache — the
- * default is the repeatable entry; the run settles with its result). Starts
- * the import and drains promise jobs; a module awaiting async host work
- * settles later on the run loop. XS-thread only. */
-void xsBridgeRunModule(void* machine, const char* path);
+ * default is the repeatable entry; the run settles with its result). When
+ * `paramsJSON` is non-NULL the default receives JSON.parse(paramsJSON) as its
+ * argument (a parse error rejects the run). Starts the import and drains
+ * promise jobs; a module awaiting async host work settles later on the run
+ * loop. XS-thread only. */
+void xsBridgeRunModule(void* machine, const char* path, const char* paramsJSON);
 
 /* Outcome of the last xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected.
  * When rejected, *out_err = the message (free with xsBridgeFree). XS-thread only. */
