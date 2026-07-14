@@ -60,8 +60,11 @@ void xsBridgeFree(char* s);
 
 /* Import the ES module file at `path` (absolute, or relative to cwd; between
  * modules `./`/`../` resolve against the importer; extensions are explicit —
- * `.js`/`.mjs`). Starts the import and drains promise jobs; a module awaiting
- * async host work settles later on the run loop. XS-thread only. */
+ * `.js`/`.mjs`/`.xsb`). If the module has a callable `default` export it is
+ * invoked on every run (the body evaluates only once — module cache — the
+ * default is the repeatable entry; the run settles with its result). Starts
+ * the import and drains promise jobs; a module awaiting async host work
+ * settles later on the run loop. XS-thread only. */
 void xsBridgeRunModule(void* machine, const char* path);
 
 /* Outcome of the last xsBridgeRunModule: 0 pending, 1 fulfilled, 2 rejected.

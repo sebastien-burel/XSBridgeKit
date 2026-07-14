@@ -144,8 +144,10 @@ public final class XSEngine {
 
   /// Import the ES module file at `path` (absolute, or relative to the cwd;
   /// `./`/`../` between modules resolve against the importer, extensions are
-  /// explicit). Waits for the module graph to settle (top-level await
-  /// included) and throws XSError if the module rejects.
+  /// explicit). If the module has a callable `default` export, it is invoked
+  /// on every run — the body evaluates only once (module cache), the default
+  /// is the repeatable entry. Waits until settled (top-level await and the
+  /// default's result included) and throws XSError if the run rejects.
   public func runModule(_ path: String, timeout: TimeInterval = 5) throws {
     loop.sync { xsBridgeRunModule(self.machine, path) }
     runUntilIdle(timeout: timeout)

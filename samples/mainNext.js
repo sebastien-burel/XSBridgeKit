@@ -1,1 +1,3 @@
-print(`Next: ${counter.run()}`);
+export default () => {
+  print(`Next: ${counter.run()}`);
+}

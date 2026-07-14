@@ -354,17 +354,54 @@ void fxLoadModule(txMachine* the, txSlot* module, txID moduleID)
 }
 
 /* ---------------------------------------------------------------------------
- * Run a module file — the xst way (xst.c:fxRunModuleFile): dynamic-import the
- * path, attach then(fulfilled, rejected) host functions that record the
- * outcome in the bridge, and drain promise jobs so a module with no async work
- * is settled on return. A module still awaiting host calls settles later on
- * the run loop; poll xsBridgeModuleStatus once idle.
+ * Run a module file: dynamic-import the path, attach then(fulfilled, rejected)
+ * host functions that record the outcome in the bridge, and drain promise jobs
+ * so a module with no async work is settled on return. A module still awaiting
+ * host calls settles later on the run loop; poll xsBridgeModuleStatus once idle.
+ *
+ * Entry convention: if the namespace has a callable `default` export, it is
+ * invoked on EVERY run — the module body evaluates only once (module cache),
+ * the default is the repeatable action. The run settles when the default's
+ * result settles (Promise.resolve-normalized), and a throw/rejection from the
+ * default rejects the run.
  * ------------------------------------------------------------------------- */
+
+static void xsBridgeModuleRejected(xsMachine* the);
+
+/* The default's result settled: the run is fulfilled. */
+static void xsBridgeDefaultDone(xsMachine* the)
+{
+  XSBridge* bridge = (XSBridge*)xsGetContext(the);
+  bridge->moduleStatus = 1;
+}
 
 static void xsBridgeModuleFulfilled(xsMachine* the)
 {
   XSBridge* bridge = (XSBridge*)xsGetContext(the);
-  bridge->moduleStatus = 1;
+  int chained = 0;
+  xsVars(2);
+  xsTry {
+    if (xsTypeOf(xsArg(0)) == xsReferenceType) {
+      xsVar(0) = xsGet(xsArg(0), xsID("default"));
+      if (fxIsCallable(the, &xsVar(0))) {
+        xsVar(1) = xsCallFunction0(xsVar(0), xsUndefined);
+        /* Settle the run with the default's result, sync or async alike. */
+        xsVar(1) = xsCall1(xsGet(xsGlobal, xsID("Promise")), xsID("resolve"), xsVar(1));
+        xsVar(1) = xsCall2(xsVar(1), xsID("then"),
+                           xsNewHostFunction(xsBridgeDefaultDone, 1),
+                           xsNewHostFunction(xsBridgeModuleRejected, 1));
+        chained = 1;
+      }
+    }
+    if (!chained)
+      bridge->moduleStatus = 1;
+  }
+  xsCatch {
+    /* The default threw synchronously. */
+    bridge->moduleStatus = 2;
+    free(bridge->moduleError);
+    bridge->moduleError = strdup(xsToString(xsException));
+  }
 }
 
 static void xsBridgeModuleRejected(xsMachine* the)
