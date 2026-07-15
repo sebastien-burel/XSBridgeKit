@@ -23,4 +23,14 @@ uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken);
  * xsBridgePromise. */
 char* xsBridgeArgJSON(xsMachine* the, int index);
 
+/* One host function for the snapshot callback table (name = a stable label for
+ * the prefix guard, not necessarily the JS property name). */
+typedef struct { const char* name; xsCallback callback; } XSBridgeHostFn;
+
+/* Register the process-wide, append-only host-function table used to project /
+ * unproject C callbacks across a snapshot. Call once at startup, before any
+ * xsBridgeReadSnapshot. Must list every host function that can be reachable
+ * from the heap at snapshot time, in a stable order. */
+void xsBridgeRegisterHostTable(const XSBridgeHostFn* fns, int count);
+
 #endif /* XSB_BRIDGE_XS_H */

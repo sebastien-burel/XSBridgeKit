@@ -24,20 +24,40 @@ c.symbolModulo = 127
 c.parserBufferSize = 64 * 1024
 c.parserTableModulo = 1993
 
-guard let engine = XSEngine(creation:c) else { exit(1) }
-engine.withMachine {
-  xsBridgeCliInstall($0)
+// Leading flags, in any order:
+//   --restore <snap>  : rebuild the machine from a snapshot before running.
+//   --snapshot <snap> : write the machine to a snapshot after running.
+// Combine them to persist a session: --restore in.xsbk --snapshot out.xsbk file.js
+var args = Array(CommandLine.arguments.dropFirst())
+var restorePath: String? = nil
+var snapshotOut: String? = nil
+while args.count >= 2, args[0] == "--restore" || args[0] == "--snapshot" {
+  if args[0] == "--restore" { restorePath = args[1] } else { snapshotOut = args[1] }
+  args.removeFirst(2)
+}
+
+let engine: XSEngine
+if let restorePath {
+  xsBridgeCliRegister()   // host table must be known before restoring
+  guard let data = try? Data(contentsOf: URL(fileURLWithPath: restorePath)),
+        let restored = XSEngine(snapshot: data) else {
+    FileHandle.standardError.write(Data("restore failed: \(restorePath)\n".utf8))
+    exit(1)
+  }
+  engine = restored
+} else {
+  guard let fresh = XSEngine(creation: c) else { exit(1) }
+  fresh.withMachine { xsBridgeCliInstall($0) }
+  engine = fresh
 }
 
 do {
-  if CommandLine.arguments.count > 1 {
-    // argv[1...] = fichiers JS, exécutés en séquence comme modules ES sur la
-    // même machine (chargés par fxFindModule/fxLoadModule côté C — imports
-    // relatifs contre l'importeur, extensions explicites, top-level await ;
-    // cache de modules partagé entre les runs). Un argument qui n'est pas un
-    // fichier existant est le JSON de paramètres du module qui le précède
-    // (passé à son export default via JSON.parse). Throw si un module rejette.
-    let args = Array(CommandLine.arguments.dropFirst())
+  if !args.isEmpty {
+    // Les fichiers JS restants sont exécutés en séquence comme modules ES sur
+    // la même machine (imports relatifs contre l'importeur, extensions
+    // explicites, top-level await ; cache de modules partagé). Un argument qui
+    // n'est pas un fichier existant est le JSON de paramètres du module qui le
+    // précède (passé à son export default via JSON.parse).
     var i = 0
     while i < args.count {
       let path = args[i]
@@ -49,15 +69,20 @@ do {
       try engine.runModule(path, params: params)
       i += 1
     }
-  }
-  else {
+  } else if restorePath == nil {
     let src = "print('now=' + getCurrentTime());\n"
     print(try engine.eval(src))
     engine.runUntilIdle()
+  }
+
+  // Après exécution, persiste la machine si demandé.
+  if let snapshotOut {
+    let data = try engine.writeSnapshot()
+    try data.write(to: URL(fileURLWithPath: snapshotOut))
+    FileHandle.standardError.write(Data("snapshot written: \(snapshotOut) (\(data.count) bytes)\n".utf8))
   }
 }
 catch {
   FileHandle.standardError.write(Data("JS error: \(error)\n".utf8))
   exit(1)
-
 }

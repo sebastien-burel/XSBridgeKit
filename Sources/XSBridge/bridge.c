@@ -17,6 +17,7 @@
  */
 #include "xsAll.h"
 #include "xsScript.h"
+#include "xsSnapshot.h"
 #include "xs.h"
 
 #include "bridge.h"
@@ -631,6 +632,199 @@ void xsBridgeSetContext(void* machine, void* context)
 void* xsBridgeGetContext(void* bridge)
 {
   return ((XSBridge*)bridge)->swiftContext;
+}
+
+/* ---------------------------------------------------------------------------
+ * Snapshot — persist / restore the whole JS heap (fxWriteSnapshot /
+ * fxReadSnapshot). The XS layer already guards the engine version and the
+ * architecture (sizeof(txSlot)); what it can't know is our host-function set,
+ * which the heap references by INDEX into snapshot->callbacks. So the host
+ * registers a fixed, append-only table (name + callback), and each snapshot
+ * carries its ordered name list — a restore accepts a table whose first N
+ * names match (append is safe, reorder/removal is rejected). Only the JS heap
+ * is serialized: the XSBridge context and the mac_xs platform are rebuilt on
+ * restore (fxReadSnapshot calls fxCreateMachinePlatform and takes our context).
+ *
+ * Buffer layout: [ "XSBK" | u32 version | u32 nameCount | (u32 len, bytes)... ]
+ * followed by the raw fxWriteSnapshot bytes.
+ * ------------------------------------------------------------------------- */
+
+#define XSB_SNAPSHOT_MAGIC "XSBK"
+#define XSB_SNAPSHOT_VERSION 1u
+
+/* Process-wide host table (host functions are frozen at boot). */
+static const XSBridgeHostFn* gHostTable;
+static int gHostCount;
+
+void xsBridgeRegisterHostTable(const XSBridgeHostFn* fns, int count)
+{
+  gHostTable = fns;
+  gHostCount = count;
+}
+
+/* Engine built-ins reachable from the heap that this XS checkout installs but
+ * forgot to list in xsSnapshot.c's gxCallbacks table. fxProjectCallback falls
+ * back to snapshot->callbacks, so we supplement them here (all mxExport). They
+ * are build-constant, appended AFTER the host functions in the callback array;
+ * both write and read build the same array, so their indices resolve. Revisit
+ * on a Moddable bump: `comm -23 <installed> <gxCallbacks>` finds new gaps. */
+static const txCallback gEngineSupplements[] = {
+  fx_ArrayBuffer_fromString,
+  fx_String_fromArrayBuffer,
+};
+#define XSB_SUPPLEMENT_COUNT ((int)(sizeof(gEngineSupplements) / sizeof(gEngineSupplements[0])))
+
+/* Growable write buffer + cursor reader, both driving the snapshot I/O
+ * callbacks (return 0 on success, non-zero errno on failure). */
+typedef struct { char* data; size_t size; size_t cap; } XSBridgeWriteBuf;
+typedef struct { const char* data; size_t size; size_t pos; } XSBridgeReadBuf;
+
+static int xsBridgeBufWrite(void* stream, void* address, size_t size)
+{
+  XSBridgeWriteBuf* b = (XSBridgeWriteBuf*)stream;
+  if (b->size + size > b->cap) {
+    size_t ncap = b->cap ? b->cap * 2 : 64 * 1024;
+    while (ncap < b->size + size) ncap *= 2;
+    char* nd = (char*)realloc(b->data, ncap);
+    if (!nd) return C_ENOMEM;
+    b->data = nd;
+    b->cap = ncap;
+  }
+  memcpy(b->data + b->size, address, size);
+  b->size += size;
+  return 0;
+}
+
+static int xsBridgeBufRead(void* stream, void* address, size_t size)
+{
+  XSBridgeReadBuf* r = (XSBridgeReadBuf*)stream;
+  if (r->pos + size > r->size) return C_EINVAL;
+  memcpy(address, r->data + r->pos, size);
+  r->pos += size;
+  return 0;
+}
+
+/* Fill a txSnapshot's version tag + callback table (shared by write/read).
+ * `callbacks` must hold gHostCount + XSB_SUPPLEMENT_COUNT entries: the host
+ * functions first (guarded by the name list), then the engine supplements. */
+static void xsBridgeFillSnapshot(txSnapshot* snap, txCallback* callbacks)
+{
+  static char signature[] = "XSBridge " __DATE__;
+  int n = 0;
+  for (int i = 0; i < gHostCount; i++)
+    callbacks[n++] = gHostTable[i].callback;
+  for (int i = 0; i < XSB_SUPPLEMENT_COUNT; i++)
+    callbacks[n++] = gEngineSupplements[i];
+  memset(snap, 0, sizeof(txSnapshot));
+  snap->signature = (txString)signature;
+  snap->signatureLength = sizeof(signature) - 1;
+  snap->callbacks = callbacks;
+  snap->callbacksLength = n;
+}
+
+int xsBridgeWriteSnapshot(void* machine, char** out, size_t* outLen)
+{
+  *out = NULL;
+  *outLen = 0;
+  if (gHostCount <= 0)
+    return -1;
+
+  txCallback* callbacks = (txCallback*)calloc((size_t)(gHostCount + XSB_SUPPLEMENT_COUNT), sizeof(txCallback));
+  XSBridgeWriteBuf buf = { NULL, 0, 0 };
+  txSnapshot snap;
+  xsBridgeFillSnapshot(&snap, callbacks);
+  snap.stream = &buf;
+  snap.write = xsBridgeBufWrite;
+
+  /* Our header: magic + version + ordered host-function names. */
+  uint32_t u = XSB_SNAPSHOT_VERSION;
+  int err = xsBridgeBufWrite(&buf, XSB_SNAPSHOT_MAGIC, 4);
+  if (!err) err = xsBridgeBufWrite(&buf, &u, sizeof(u));
+  u = (uint32_t)gHostCount;
+  if (!err) err = xsBridgeBufWrite(&buf, &u, sizeof(u));
+  for (int i = 0; i < gHostCount && !err; i++) {
+    uint32_t len = (uint32_t)strlen(gHostTable[i].name);
+    err = xsBridgeBufWrite(&buf, &len, sizeof(len));
+    if (!err) err = xsBridgeBufWrite(&buf, (void*)gHostTable[i].name, len);
+  }
+
+  /* The engine appends the heap. NB: fxWriteSnapshot returns 1 on success,
+   * 0 on failure (inverted); the real error code is snap.error. */
+  if (!err) {
+    fxWriteSnapshot((xsMachine*)machine, &snap);
+    err = snap.error;
+  }
+
+  free(callbacks);
+  if (err) {
+    free(buf.data);
+    return err;
+  }
+  *out = buf.data;
+  *outLen = buf.size;
+  return 0;
+}
+
+/* Read a u32 from the reader, or return the error. */
+static int xsBridgeReadU32(XSBridgeReadBuf* r, uint32_t* v)
+{
+  return xsBridgeBufRead(r, v, sizeof(*v));
+}
+
+void* xsBridgeReadSnapshot(const char* bytes, size_t len)
+{
+  if (gHostCount <= 0)
+    return NULL;
+
+  XSBridgeReadBuf r = { bytes, len, 0 };
+  char magic[4];
+  uint32_t version = 0, nameCount = 0;
+  if (xsBridgeBufRead(&r, magic, 4) || memcmp(magic, XSB_SNAPSHOT_MAGIC, 4)) {
+    fprintf(stderr, "snapshot: bad magic\n");
+    return NULL;
+  }
+  if (xsBridgeReadU32(&r, &version) || version != XSB_SNAPSHOT_VERSION) {
+    fprintf(stderr, "snapshot: unsupported version\n");
+    return NULL;
+  }
+  /* Prefix check: the snapshot's names must equal the first nameCount entries
+   * of the registered table (a longer table = appended functions, allowed). */
+  if (xsBridgeReadU32(&r, &nameCount) || (int)nameCount > gHostCount) {
+    fprintf(stderr, "snapshot: host table shorter than snapshot\n");
+    return NULL;
+  }
+  for (uint32_t i = 0; i < nameCount; i++) {
+    uint32_t nlen = 0;
+    char name[256];
+    if (xsBridgeReadU32(&r, &nlen) || nlen >= sizeof(name)
+        || xsBridgeBufRead(&r, name, nlen)) {
+      fprintf(stderr, "snapshot: truncated host name\n");
+      return NULL;
+    }
+    name[nlen] = 0;
+    if (strcmp(name, gHostTable[i].name)) {
+      fprintf(stderr, "snapshot: host table mismatch at %u (snapshot=%s, table=%s)\n",
+              i, name, gHostTable[i].name);
+      return NULL;
+    }
+  }
+
+  txCallback* callbacks = (txCallback*)calloc((size_t)(gHostCount + XSB_SUPPLEMENT_COUNT), sizeof(txCallback));
+  txSnapshot snap;
+  xsBridgeFillSnapshot(&snap, callbacks);
+  snap.stream = &r;             /* cursor now positioned past our header */
+  snap.read = xsBridgeBufRead;
+
+  XSBridge* bridge = (XSBridge*)calloc(1, sizeof(XSBridge));
+  xsMachine* machine = fxReadSnapshot(&snap, "XSBridge", bridge);
+  free(callbacks);
+  if (!machine || snap.error) {
+    fprintf(stderr, "snapshot: read failed (%d)\n", snap.error);
+    free(bridge);
+    return NULL;
+  }
+  bridge->machine = machine;
+  return machine;
 }
 
 /* ---------------------------------------------------------------------------

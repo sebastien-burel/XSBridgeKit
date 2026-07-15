@@ -7,6 +7,7 @@
 #include "xsAll.h"
 #include "xs.h"
 #include "bridge.h"
+#include "bridgeXS.h"
 #include "xsBridgeCli.h"
 #include <sys/time.h>
 #include <stdio.h>
@@ -33,8 +34,16 @@ void xsGetCurrentTime(xsMachine* the)
   }
 }
 
+/* Frozen, append-only host table for snapshot callback projection. */
+static const XSBridgeHostFn gCliHostTable[] = {
+  { "print", xs_cli_print },
+  { "getCurrentTime", xsGetCurrentTime },
+};
+
 void xsBridgeCliInstall(void* machine)
 {
+  xsBridgeRegisterHostTable(gCliHostTable,
+                            (int)(sizeof(gCliHostTable) / sizeof(gCliHostTable[0])));
   xsBeginHost((xsMachine*)machine);
   {
     xsVars(1);
@@ -49,4 +58,12 @@ void xsBridgeCliInstall(void* machine)
     }
   }
   xsEndHost((xsMachine*)machine);
+}
+
+/* Register the host table without a machine — needed before restoring a
+ * snapshot (the restore path has no machine to install onto yet). */
+void xsBridgeCliRegister(void)
+{
+  xsBridgeRegisterHostTable(gCliHostTable,
+                            (int)(sizeof(gCliHostTable) / sizeof(gCliHostTable[0])));
 }

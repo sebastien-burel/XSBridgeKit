@@ -117,10 +117,47 @@ public final class XSEngine {
     }
   }
 
+  /// Restore an engine from snapshot bytes produced by `writeSnapshot()`. The
+  /// host table must already be registered (the consumer's C install/register
+  /// path) and be prefix-compatible with the snapshot's, else this returns nil.
+  public init?(snapshot: Data) {
+    let made: UnsafeMutableRawPointer? = loop.sync {
+      snapshot.withUnsafeBytes { raw in
+        xsBridgeReadSnapshot(raw.bindMemory(to: CChar.self).baseAddress, raw.count)
+      }
+    }
+    guard let the = made else { return nil }
+    self.machine = the
+    loop.sync {
+      xsBridgeSetContext(the, Unmanaged.passUnretained(self).toOpaque())
+    }
+  }
+
   deinit {
     let the = machine
     loop.sync { xsBridgeDeleteMachine(the) }
     loop.stop()
+  }
+
+  /// Serialize the whole JS heap to bytes (restore with `init(snapshot:)`).
+  /// Throws if async calls are still in flight (`pendingCount != 0`) — their
+  /// settlement lives in Swift, off the heap, so a mid-flight snapshot would
+  /// capture Promises that never resolve.
+  public func writeSnapshot() throws -> Data {
+    let result: Result<Data, XSError> = loop.sync {
+      if Int(xsBridgePendingCount(self.machine)) != 0 {
+        return .failure(XSError(message: "snapshot requires idle (pending calls in flight)"))
+      }
+      var out: UnsafeMutablePointer<CChar>?
+      var len = 0
+      let err = xsBridgeWriteSnapshot(self.machine, &out, &len)
+      defer { if let out { xsBridgeFree(out) } }
+      guard err == 0, let out else {
+        return .failure(XSError(message: "snapshot write failed (\(err))"))
+      }
+      return .success(Data(bytes: out, count: len))
+    }
+    return try result.get()
   }
 
   /// Evaluate JS source synchronously on the XS thread.

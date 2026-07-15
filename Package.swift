@@ -10,6 +10,10 @@ let xsDefines: [CSetting] = [
   .define("XSPLATFORM", to: "\"mac_xs.h\""),
   .define("mxDebug", to: "1"),
   .define("mxStringInfoCacheLength", to: "4"),
+  // Snapshot-clean engine: fxStringX copies into the heap (no external string
+  // values) and chunk layout is deterministic — required by fxWriteSnapshot.
+  // ABI-affecting (txChunk layout), so it MUST be identical across all C targets.
+  .define("mxSnapshot", to: "1"),
 ]
 
 // Header search paths are relative to each target's directory, so consumer C

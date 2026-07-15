@@ -47,6 +47,20 @@ Consumers `import XSBridgeKit` (plus `XSBridge` for the flat settle functions).
 `xsBridgeTest` (harness + `DemoHost`) depends on `XSBridgeKit` + `XSBridge` +
 `xsBridgeTestC`. Public API: `XSEngine`, `XSError`.
 
+**Snapshot (persist / restore the JS heap).** `engine.writeSnapshot() -> Data` serializes
+the whole machine (`fxWriteSnapshot`); `XSEngine(snapshot:)` restores it in a fresh process
+(`fxReadSnapshot`, which rebuilds the mac_xs platform and takes our `XSBridge*` context) —
+fast startup + state persistence across launches. Write requires idle (`pendingCount == 0`:
+in-flight calls settle in Swift, off the heap). The engine references host C functions in
+the heap **by index** into a callback table, so the consumer registers a frozen, append-only
+`XSBridgeRegisterHostTable(name, callback)`; each snapshot carries its ordered name list and
+a restore accepts a prefix-compatible superset (append safe, reorder/removal rejected). Two
+build requirements: `mxSnapshot` (defined in `Package.swift`) makes the engine
+snapshot-clean (strings copied into the heap, deterministic chunk layout); and `bridge.c`
+supplements `snapshot->callbacks` with a few engine built-ins this Moddable checkout installs
+but omits from `xsSnapshot.c`'s `gxCallbacks` (`fx_ArrayBuffer_fromString`,
+`fx_String_fromArrayBuffer`) — recheck that list on a Moddable bump.
+
 **Streaming over a reverse channel.** `host.stream(prompt, onToken)` roots `onToken` for the
 whole call (3 roots total: `xsBridgePromise(the, &xsArg(1))`). Swift emits tokens via
 `xsBridgeEmitToken` (message kind `XSB_TOKEN`) which the job callback delivers as
@@ -173,8 +187,10 @@ the harness *is* the test suite. To exercise a single behaviour, run the corresp
 agent in `agents/` from the harness.
 
 The C target is based on the macOS port: `XSPLATFORM="mac_xs.h"` and `platforms/mac_xs.c`
-is compiled. The remaining `#define`s in `Package.swift` (`mxProfile`, `mxNoConsole`,
-`mxStringInfoCacheLength`) tune the engine; the platform-specific `mxUse*` defines come from
+is compiled. The remaining `#define`s in `Package.swift` (`mxDebug`,
+`mxStringInfoCacheLength`, `mxSnapshot`) tune the engine — `mxSnapshot` is ABI-affecting
+(txChunk layout) so it must stay identical across every C target; the platform-specific
+`mxUse*` defines come from
 `mac_xs.h` itself. The bridge was originally modelled on the `xst` target
 (`$MODDABLE/xs/makefiles/mac`, `$MODDABLE/documentation/xs/xst.md`), then rebased onto
 `mac_xs` to reuse the upstream run-loop integration.

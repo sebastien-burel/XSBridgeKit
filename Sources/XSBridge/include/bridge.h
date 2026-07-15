@@ -10,6 +10,7 @@
 #define XSB_BRIDGE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* ---- Machine lifecycle ---- */
 
@@ -95,6 +96,20 @@ void xsBridgeCollectGarbage(void* machine);
 
 /* Leak accounting: total xsRemember vs xsForget calls (must match when idle). */
 void xsBridgeDebugCounts(void* machine, uint32_t* remembered, uint32_t* forgotten);
+
+/* ---- Snapshot (persist / restore the JS heap) ---- */
+
+/* Serialize the machine into a malloc'd buffer (*out, *outLen; free with
+ * xsBridgeFree). Returns 0 on success, non-zero on error. Call at idle
+ * (pending count 0) — in-flight async calls settle in Swift, off the heap.
+ * Requires a host table registered via xsBridgeRegisterHostTable. XS-thread only. */
+int xsBridgeWriteSnapshot(void* machine, char** out, size_t* outLen);
+
+/* Restore a machine from snapshot bytes (creates it, reattaches the platform).
+ * Rejects if the XS version/architecture differ or the registered host table is
+ * not a prefix-compatible superset of the snapshot's. Returns an opaque handle
+ * or NULL. Must run on the target run-loop thread. */
+void* xsBridgeReadSnapshot(const char* bytes, size_t len);
 
 /* The XS-typed helpers for consumer C host-function targets (xsBridgePromise)
  * live in bridgeXS.h, which is NOT part of the clang module — include it
