@@ -27,6 +27,10 @@ let package = Package(
     products: [
         // Reusable Swift API consumed by host apps (e.g. TyKaoz).
         .library(name: "XSBridgeKit", targets: ["XSBridgeKit"]),
+        // The flat C bridge (bridge.h: xsBridgePromise, settle functions, the XS
+        // headers). Exposed so a consumer can build its own C host-function
+        // target and call the settle functions from @_cdecl Swift.
+        .library(name: "XSBridge", targets: ["XSBridge"]),
     ],
     targets: [
         // C layer: the XS engine + the bridge shim.
