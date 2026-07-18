@@ -1,7 +1,7 @@
 // XSEngine — Swift wrapper over the C bridge, running each XS machine on its own
 // dedicated thread + CFRunLoop (A3). XS is single-threaded (PLAN invariant 3):
 // every machine access is marshalled onto that thread; async completions
-// (xsBridgeComplete / xsBridgeEmitToken) wake the same run loop, so they settle there
+// (xsServiceResolve / xsServiceEmit) wake the same run loop, so they settle there
 // too. Callers (e.g. a UI thread) never touch the machine directly.
 
 import XSBridge
@@ -221,14 +221,14 @@ public final class XSEngine {
   /// this engine. The consumer then sets a global `__serviceHandler(method,
   /// args)` (synchronous or Promise-returning) that answers incoming calls.
   public func installServiceServer() {
-    withMachine { xsBridgeInstallServiceServer($0) }
+    withMachine { xsServiceInstallServer($0) }
   }
 
-  /// Link this engine so its host functions (via `xsBridgeServiceCall`) call
+  /// Link this engine so its host functions (via `xsServiceInvoke`) call
   /// services on `server`. Values cross as alien-marshalled data — the two
   /// engines need no shared preparation.
   public func linkService(to server: XSEngine) {
-    server.withMachine { s in self.withMachine { c in xsBridgeLinkService(c, s) } }
+    server.withMachine { s in self.withMachine { c in xsServiceLink(c, s) } }
   }
 
   /// Block until all in-flight async calls have settled (or timeout). The

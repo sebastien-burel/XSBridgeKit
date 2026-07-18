@@ -15,20 +15,20 @@
  * pointer to an argument slot, e.g. &xsArg(1)) in a message record, and
  * returns the call id. Call from inside a C host function, then hand
  * (xsGetContext(the), id) to Swift, which settles later with
- * xsBridgeComplete / xsBridgeEmitToken. */
-uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken);
+ * xsServiceResolve / xsServiceEmit. */
+uint32_t xsServicePromise(xsMachine* the, xsSlot* onToken);
 
 /* JSON.stringify(xsArg(index)) as a malloc'd UTF-8 string (free() after
  * handing off to Swift). Uses xsResult as scratch — call it BEFORE
- * xsBridgePromise. */
+ * xsServicePromise. */
 char* xsBridgeArgJSON(xsMachine* the, int index);
 
 /* Part D: call a service on this machine's linked target machine. Creates the
  * Promise on `the` (xsResult), alien-marshals `*args` and posts the request to
- * the target (linked via xsBridgeLinkService); the target's global
+ * the target (linked via xsServiceLink); the target's global
  * `__serviceHandler(method, args)` produces the result, marshalled back and
  * used to settle the Promise. Call from inside a consumer host function. */
-void xsBridgeServiceCall(xsMachine* the, const char* method, xsSlot* args);
+void xsServiceInvoke(xsMachine* the, const char* method, xsSlot* args);
 
 /* One host function for the snapshot callback table (name = a stable label for
  * the prefix guard, not necessarily the JS property name). */

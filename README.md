@@ -31,7 +31,7 @@ Add the package as a local SPM dependency:
 // ...
 .target(name: "YourApp", dependencies: [
     .product(name: "XSBridgeKit", package: "XSBridgeKit"),
-    "XSBridge",          // C module: flat settle functions + xsBridgePromise
+    "XSBridge",          // C module: flat settle functions + xsServicePromise
     "YourHostC",         // your own C host-function target (see below)
 ]),
 ```
@@ -45,7 +45,7 @@ This is the reference pattern used by the demo (`xsBridgeTestC/demoHost.c` +
 `DemoHost.swift`).
 
 **C side** — one host function per capability. An async one marshals its arguments, creates
-its Promise with `xsBridgePromise`, and hands `(bridge, id, json)` to Swift:
+its Promise with `xsServicePromise`, and hands `(bridge, id, json)` to Swift:
 
 ```c
 #include "xs.h"
@@ -58,7 +58,7 @@ extern double myAdd(double a, double b);
 static void xs_echo(xsMachine* the) {           // host.echo(x) — async
     void* bridge = xsGetContext(the);
     char* json = xsBridgeArgJSON(the, 0);       // JSON.stringify(arg0), malloc'd
-    uint32_t id = xsBridgePromise(the, NULL);   // xsResult = the Promise
+    uint32_t id = xsServicePromise(the, NULL);  // xsResult = the Promise
     myEcho(bridge, id, json);
     free(json);
 }
@@ -80,8 +80,8 @@ void MyHostInstall(void* machine) {
 ```
 
 **Swift side** — `@_cdecl` counterparts. Async work runs off the XS thread and settles via
-the flat `xsBridgeComplete` / `xsBridgeEmitToken` (thread-safe; they wake the engine's run
-loop). Values cross the boundary as **UTF-8 JSON**:
+the flat `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (thread-safe; they wake the
+engine's run loop). Values cross the boundary as **UTF-8 JSON**:
 
 ```swift
 import XSBridge   // flat C settle functions
@@ -94,8 +94,8 @@ func myEcho(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32, _ json: UnsafePoin
     guard let bridge else { return }
     let payload = json.map { String(cString: $0) } ?? "null"
     DispatchQueue.global().async {
-        xsBridgeComplete(bridge, id, 1, payload)   // 1 = resolve, 0 = reject
-        // xsBridgeEmitToken(bridge, id, tokenJSON) — stream a token, call stays open
+        xsServiceResolve(bridge, id, payload)      // or xsServiceReject(bridge, id, errJSON)
+        // xsServiceEmit(bridge, id, tokenJSON) — stream a token, call stays open
     }
 }
 ```
@@ -134,11 +134,11 @@ try engine.runModule("agent.js", params: #"{"n":5}"#)  // default(JSON.parse(par
 | `engine.withMachine { … }` | Run C on the XS thread with the opaque machine handle (install hook). |
 | `engine.pendingCount` | Number of in-flight async calls. |
 | `engine.installServiceServer()` | Make this engine answer cross-machine calls (set a global `__serviceHandler`). |
-| `engine.linkService(to:)` | Let this engine's host functions call services on another engine (`xsBridgeServiceCall`). |
+| `engine.linkService(to:)` | Let this engine's host functions call services on another engine (`xsServiceInvoke`). |
 | `XSCreation` | VM sizing (heap/stack/key counts) with validated defaults. |
 | `XSError` | A JS error surfaced to Swift as a message (never a crash). |
-| `xsBridgePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
-| `xsBridgeComplete` / `xsBridgeEmitToken` (C, `bridge.h`) | Settle / stream an async call from any thread. |
+| `xsServicePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
+| `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (C, `bridge.h`) | Settle / stream an async call from any thread. |
 
 ## Snapshots (persist / restore)
 
@@ -160,10 +160,12 @@ let restored = XSEngine(snapshot: bytes)
 Several engines can call each other. Mark one engine as a server
 (`installServiceServer()`, then set a global `__serviceHandler(method, args)` — synchronous
 or returning a Promise); link a client engine to it (`linkService(to:)`). A client host
-function then calls `xsBridgeServiceCall(the, method, &args)`; the argument and result cross
+function then calls `xsServiceInvoke(the, method, &args)`; the argument and result cross
 as **alien-marshalled** values (self-contained, so the machines need no shared preparation —
-`xsCreateMachine`, not clone), settling the caller's `await`. This is how an agent can spawn
-and delegate to a sub-agent running on its own engine, JS-to-JS.
+`xsCreateMachine`, not clone), settling the caller's `await`. Under the hood this reuses the
+same settlement path as native calls (`ServiceEventResolve`/`Reject`) — only the payload
+differs (alien blob vs JSON). This is how an agent can spawn and delegate to a sub-agent
+running on its own engine, JS-to-JS.
 
 ## Invariants
 
