@@ -1,4 +1,0 @@
-module XSBridgeCliC {
-    header "xsBridgeCli.h"
-    export *
-}
