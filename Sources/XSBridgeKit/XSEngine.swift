@@ -215,6 +215,22 @@ public final class XSEngine {
     loop.sync { body(self.machine) }
   }
 
+  // MARK: - Multi-machine services (Part D)
+
+  /// Install the service-server plumbing (`__serviceReply` + `__runService`) on
+  /// this engine. The consumer then sets a global `__serviceHandler(method,
+  /// args)` (synchronous or Promise-returning) that answers incoming calls.
+  public func installServiceServer() {
+    withMachine { xsBridgeInstallServiceServer($0) }
+  }
+
+  /// Link this engine so its host functions (via `xsBridgeServiceCall`) call
+  /// services on `server`. Values cross as alien-marshalled data — the two
+  /// engines need no shared preparation.
+  public func linkService(to server: XSEngine) {
+    server.withMachine { s in self.withMachine { c in xsBridgeLinkService(c, s) } }
+  }
+
   /// Block until all in-flight async calls have settled (or timeout). The
   /// dedicated thread's run loop applies completions on its own; we just wait.
   public func runUntilIdle(timeout: TimeInterval = 5) {

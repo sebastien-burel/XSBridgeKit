@@ -386,4 +386,60 @@ do {
     phaseResult(6, before)
 }
 
+// PHASE 7: multi-machine service round-trip (Part D). A client machine calls a
+// service on a separate server machine; args and result cross as alien-
+// marshalled values over the worker-job transport — no shared preparation.
+do {
+    let before = failures
+    print("PHASE 7: multi-machine service (alien marshalling)")
+    if let server = XSEngine(), let client = makeEngine() {
+        // Swift multi-machine API (D2): install the server plumbing + link.
+        server.installServiceServer()
+        _ = try? server.eval("""
+            globalThis.__serviceHandler = function (method, args) {
+                if (method === 'asyncAdd')
+                    return new Promise(function (res) { res({ sum: args.x + args.y, async: true }); });
+                return { method: method, echoed: args, sum: (args.x || 0) + (args.y || 0) };
+            };
+            """)
+        client.linkService(to: server)
+
+        // JS Proxy ergonomics (D2): `service.method(args)` over host.callService.
+        _ = try? client.eval("""
+            globalThis.service = new Proxy({}, {
+                get: function (target, method) {
+                    return function (args) { return host.callService(String(method), args); };
+                }
+            });
+            """)
+
+        // Synchronous handler, called as service.add(...).
+        _ = try? client.eval("""
+            globalThis.__r1 = 'pending';
+            service.add({ x: 2, y: 3 })
+                .then(function (r) { globalThis.__r1 = r; })
+                .catch(function (e) { globalThis.__r1 = { error: String(e) }; });
+            """)
+        client.runUntilIdle(timeout: 5)
+        let got1 = (try? client.eval("globalThis.__r1")) ?? "<none>"
+        check("sync service via proxy (got \(got1))",
+              got1.contains("\"sum\":5") && got1.contains("\"method\":\"add\""))
+
+        // Async (Promise-returning) handler, called as service.asyncAdd(...).
+        _ = try? client.eval("""
+            globalThis.__r2 = 'pending';
+            service.asyncAdd({ x: 4, y: 5 })
+                .then(function (r) { globalThis.__r2 = r; })
+                .catch(function (e) { globalThis.__r2 = { error: String(e) }; });
+            """)
+        client.runUntilIdle(timeout: 5)
+        let got2 = (try? client.eval("globalThis.__r2")) ?? "<none>"
+        check("async service via proxy (got \(got2))",
+              got2.contains("\"sum\":9") && got2.contains("\"async\":true"))
+    } else {
+        check("create two engines", false)
+    }
+    phaseResult(7, before)
+}
+
 exit(failures == 0 ? 0 : 1)
