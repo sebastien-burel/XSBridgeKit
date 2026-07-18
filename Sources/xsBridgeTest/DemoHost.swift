@@ -1,7 +1,7 @@
 // DemoHost — Swift side of the demo host (echo / stream / fail / add), the
 // regression surface of the 6-phase suite. The C target xsBridgeTestC installs
 // host.* functions that call these @_cdecl entry points; async results settle
-// via xsBridgeComplete / xsBridgeEmitToken. A real consumer (TyKaoz) supplies
+// via xsServiceResolve / xsServiceEmit. A real consumer (TyKaoz) supplies
 // its own C+Swift pair mapping host functions to tools and LLM providers.
 
 import XSBridge
@@ -39,7 +39,7 @@ func xsbDemoEcho(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32, _ json: Unsaf
     guard let bridge else { return }
     let payload = json.map { String(cString: $0) } ?? "null"
     DemoHost.queue.asyncAfter(deadline: .now() + DemoHost.callLatency) {
-        xsBridgeComplete(bridge, id, 1, payload)
+        xsServiceResolve(bridge, id, payload)
     }
 }
 
@@ -47,7 +47,7 @@ func xsbDemoEcho(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32, _ json: Unsaf
 func xsbDemoFail(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32) {
     guard let bridge else { return }
     DemoHost.queue.asyncAfter(deadline: .now() + DemoHost.callLatency) {
-        xsBridgeComplete(bridge, id, 0, DemoHost.jsonString("deliberate failure"))
+        xsServiceReject(bridge, id, DemoHost.jsonString("deliberate failure"))
     }
 }
 
@@ -60,9 +60,9 @@ func xsbDemoStream(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32) {
         for token in tokens {
             Thread.sleep(forTimeInterval: DemoHost.streamLatency)
             full += token
-            xsBridgeEmitToken(bridge, id, DemoHost.jsonString(token))
+            xsServiceEmit(bridge, id, DemoHost.jsonString(token))
         }
         Thread.sleep(forTimeInterval: DemoHost.streamLatency)
-        xsBridgeComplete(bridge, id, 1, DemoHost.jsonString(full))
+        xsServiceResolve(bridge, id, DemoHost.jsonString(full))
     }
 }

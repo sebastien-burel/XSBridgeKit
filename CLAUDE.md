@@ -27,9 +27,9 @@ their own). A consumer supplies its own small C target (compiled with the **same
 defines** as `XSBridge` — the `txMachine` ABI depends on them) whose install function
 (`xsNewHostFunction` + `xsSet`, run via `XSEngine.withMachine`) registers each native
 capability directly. Each C host function marshals its arguments to plain C values, and —
-for async calls — creates its Promise via `xsBridgePromise` (declared in `bridgeXS.h`),
+for async calls — creates its Promise via `xsServicePromise` (declared in `bridgeXS.h`),
 then hands `(bridge, id, params)` to its Swift `@_cdecl` counterpart; Swift settles later
-with `xsBridgeComplete` / `xsBridgeEmitToken`. There is no JS prelude, no string-keyed
+with `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit`. There is no JS prelude, no string-keyed
 dispatch, no Swift protocol: the pair `xsBridgeTestC/demoHost.c` + `DemoHost.swift`
 (echo/stream/fail/add, plus a multi-machine service call) is the reference pattern, kept
 as the regression suite.
@@ -62,11 +62,11 @@ but omits from `xsSnapshot.c`'s `gxCallbacks` (`fx_ArrayBuffer_fromString`,
 `fx_String_fromArrayBuffer`) — recheck that list on a Moddable bump.
 
 **Streaming over a reverse channel.** `host.stream(prompt, onToken)` roots `onToken` for the
-whole call (3 roots total: `xsBridgePromise(the, &xsArg(1))`). Swift emits tokens via
-`xsBridgeEmitToken` (message kind `XSB_TOKEN`) which the job callback delivers as
-`onToken(delta)` while keeping the call open; a final `xsBridgeComplete`
-(`XSB_RESOLVE`/`XSB_REJECT`) settles and forgets all roots. Tokens use `xsBridgeFindMessage`
-(non-unlinking), settlements use `xsBridgeUnlinkMessage`.
+whole call (3 roots total: `xsServicePromise(the, &xsArg(1))`). Swift emits tokens via
+`xsServiceEmit` — a worker job whose `ServiceEventToken` callback delivers
+`onToken(delta)` while keeping the call open; a final `xsServiceResolve` / `xsServiceReject`
+(the `ServiceEventResolve` / `ServiceEventReject` callbacks) settles and forgets all roots.
+Tokens use `xsBridgeFindMessage` (non-unlinking), settlements use `xsBridgeUnlinkMessage`.
 
 **Reject path & GC.** `host.fail` exercises the reject path; `xsBridgeCollectGarbage` forces
 GC on the XS thread and `runUntilIdleForcingGC` drives a forced full GC on every run-loop
@@ -75,21 +75,21 @@ completion and no id crosstalk. `DemoHost` uses a small `callLatency` (5 ms, ech
 larger `streamLatency` (50 ms, between tokens).
 
 The machine **context is a `XSBridge*`** (allocated in `xsBridgeCreateMachine`), holding:
-the in-flight `XSMessage` records (`{id → (resolve,reject)}`), remember/forget counters,
+the in-flight `ServiceMessage` records (`{id → (resolve,reject)}`), remember/forget counters,
 module status, and `swiftContext` (the unretained `XSEngine` pointer, set via
 `xsBridgeSetContext`, recoverable from consumer `@_cdecl` functions via
 `xsBridgeGetContext`). The `print` capture asserted by the harness lives in
 `xsBridgeTestC` (`xsBridgeTestOutputCount/At`), not in the bridge.
 
 Async flow: JS `host.echo(x)` enters the consumer's C host function, which stringifies the
-argument, calls `xsBridgePromise` — creates the Promise **in C** (`fxNewPromiseCapability`),
+argument, calls `xsServicePromise` — creates the Promise **in C** (`fxNewPromiseCapability`),
 copies resolve/reject into a malloc'd record and `fxRemember`s them **before any further
 allocation** (so GC tracks/relocates them), sets `xsResult` to the promise — then hands
 `(bridge, id, json)` to its Swift `@_cdecl` function. Swift works on a background
-`DispatchQueue`, then `xsBridgeComplete` (bg thread) posts a worker job and wakes the XS
-run loop. The job callback `xsBridgeEventPerform` (XS thread) settles via
-`xsCallFunction1(xsAccess(rec->resolve),…)`, `fxForget`s, frees the record, and drains
-`fxRunPromiseJobs` to resume the `await`.
+`DispatchQueue`, then `xsServiceResolve` / `xsServiceReject` (bg thread) posts a worker job and wakes the XS
+run loop. The settle callback `ServiceEventResolve` / `ServiceEventReject` (XS thread, shared
+`xsServiceSettle`) settles via `xsCallFunction1(xsAccess(rec->resolve),…)`, `fxForget`s, frees
+the record, and drains `fxRunPromiseJobs` to resume the `await`.
 
 Key rooting rule: a remembered slot must live in stable C memory and be rooted *before*
 any allocating XS call — the GC root list (`the->cRoot`) points at `&rec->resolve`. The C
@@ -122,13 +122,15 @@ Sources/
   XSBridge/               # C target: XS sources + mac platform + the bridge shim
     include/module.modulemap   # exposes bridge.h to Swift
     include/bridge.h           # flat C API, NO XS macros leak across it
-    include/bridgeXS.h         # XS-typed helpers (xsBridgePromise) — textual include for C targets, never Swift
+    include/bridgeXS.h         # XS-typed helpers (xsServicePromise) — textual include for C targets, never Swift
+    include/bridgeInternal.h   # C-target internals shared by bridge.c + service.c (structs, ServiceEvent, settle callbacks) — never Swift
     xs/                        # symlinks to $MODDABLE/xs incl. platforms/mac_xs.c (git-ignored; see scripts/link-moddable.sh)
-    bridge.c                   # machine lifecycle, xsBridgePromise, module loader, settlement via worker jobs (mac_xs.c)
+    bridge.c                   # machine lifecycle, xsServicePromise, module loader, native-peer settlement via worker jobs (mac_xs.c)
+    service.c                  # machine↔machine service peer (alien-marshalled), reusing the same settle path
   XSBridgeKit/            # Swift library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
   xsBridgeTestC/          # C side of the demo host (consumer host-function pattern)
-    demoHost.c                 # print (+capture) + host.echo/stream/fail/add — xsBridgePromise + @_cdecl calls into Swift
+    demoHost.c                 # print (+capture) + host.echo/stream/fail/add — xsServicePromise + @_cdecl calls into Swift
   xsBridgeTest/           # Swift executable: runner + test harness
     DemoHost.swift             # Swift side of the demo host: @_cdecl entry points (regression suite)
     main.swift                 # runs the test agents, asserts, exits non-zero on any failure
@@ -145,14 +147,25 @@ why `platforms/` is linked file-by-file (its other `.c` — every other platform
 not be compiled). `fdlibm` is not linked: the macOS port uses the system `libm`
 (`xsPlatform.h` maps `c_sin` → `sin`, etc.); fdlibm is only for embedded ports.
 
-The async bridge: the Promise is created **in C** by `xsBridgePromise`
+The async bridge: the Promise is created **in C** by `xsServicePromise`
 (`fxNewPromiseCapability`), which `fxRemember`s `resolve`/`reject` (+ optional `onToken`),
 generates an id, and sets `xsResult` to the promise; the consumer's host function then
 posts `(bridge, id, params)` to Swift. Swift does the work off the XS run loop, then posts
 a **worker job** via `fxQueueWorkerJob` (mac_xs.c), which signals the XS thread's run
-loop. The job callback (`xsBridgeEventPerform`) re-enters with `xsBeginHost`, looks up
-`(resolve, reject)` by id, settles the Promise, `fxForget`s, and **drains promise jobs**
-(`fxRunPromiseJobs` via `xsBridgeDrainPromises`) to resume the `await` continuation.
+loop. The settle callback (`ServiceEventResolve` / `ServiceEventReject`, sharing
+`xsServiceSettle`) re-enters with `xsBeginHost`, looks up `(resolve, reject)` by id, settles
+the Promise, `fxForget`s, and **drains promise jobs** (`fxRunPromiseJobs` via
+`xsBridgeDrainPromises`) to resume the `await` continuation.
+
+**One settle path, two peers (the "service" layer).** The async settlement above is shared
+by both the native peer (Swift-backed host functions, `bridge.c`) and the machine peer
+(machine↔machine service calls, `service.c`). Both post a `ServiceEvent` handled by the
+same `ServiceEventResolve` / `ServiceEventReject` callbacks; the only difference is
+`ServiceEvent.payload` — the native peer carries the value as **UTF-8 JSON** (a Swift edge
+cannot `xsDemarshall`), the machine peer as an **alien-marshalled blob** (self-contained,
+by name, so two independent `xsCreateMachine` machines exchange it with no shared prep).
+Public API: `xsServicePromise` / `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit`
+(native), `xsServiceInvoke` / `xsServiceLink` / `xsServiceInstallServer` (machine).
 
 ## Critical invariants (must always hold)
 

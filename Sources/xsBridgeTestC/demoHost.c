@@ -3,9 +3,9 @@
  *
  * The regression pattern for consumer host functions: each JS-callable entry
  * marshals its arguments to plain C values, creates its Promise via
- * xsBridgePromise (which roots resolve/reject in the bridge), and hands
+ * xsServicePromise (which roots resolve/reject in the bridge), and hands
  * (bridge, id, params) to its Swift @_cdecl counterpart in DemoHost.swift.
- * Swift settles later with xsBridgeComplete / xsBridgeEmitToken.
+ * Swift settles later with xsServiceResolve / xsServiceEmit.
  */
 #include "xs.h"
 #include "bridge.h"
@@ -77,7 +77,7 @@ static void xs_demo_echo(xsMachine* the)
 {
     void* bridge = xsGetContext(the);
     char* json = xsBridgeArgJSON(the, 0);
-    uint32_t id = xsBridgePromise(the, NULL);   /* xsResult = the promise */
+    uint32_t id = xsServicePromise(the, NULL);   /* xsResult = the promise */
     xsbDemoEcho(bridge, id, json);
     free(json);
 }
@@ -86,7 +86,7 @@ static void xs_demo_echo(xsMachine* the)
 static void xs_demo_fail(xsMachine* the)
 {
     void* bridge = xsGetContext(the);
-    uint32_t id = xsBridgePromise(the, NULL);
+    uint32_t id = xsServicePromise(the, NULL);
     xsbDemoFail(bridge, id);
 }
 
@@ -94,7 +94,7 @@ static void xs_demo_fail(xsMachine* the)
 static void xs_demo_stream(xsMachine* the)
 {
     void* bridge = xsGetContext(the);
-    uint32_t id = xsBridgePromise(the, &xsArg(1));   /* roots onToken too */
+    uint32_t id = xsServicePromise(the, &xsArg(1));   /* roots onToken too */
     xsbDemoStream(bridge, id);
 }
 
@@ -103,7 +103,7 @@ static void xs_demo_stream(xsMachine* the)
 static void xs_demo_service_call(xsMachine* the)
 {
     const char* method = xsToString(xsArg(0));
-    xsBridgeServiceCall(the, method, &xsArg(1));   /* xsResult = the promise */
+    xsServiceInvoke(the, method, &xsArg(1));   /* xsResult = the promise */
 }
 
 void xsBridgeTestInstall(void* machine)

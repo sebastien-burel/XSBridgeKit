@@ -76,29 +76,30 @@ int xsBridgeModuleStatus(void* machine, char** out_err);
 
 /* ---- Async settlement (from Swift background threads) ---- */
 
-/* Settle an in-flight native call by id. `success` non-zero ->
- * resolve(JSON.parse(json)); zero -> reject(...). The result is queued and the
- * machine's run loop is woken to settle on its own thread. Thread-safe. */
-void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json);
+/* Settle an in-flight native call by id: resolve(JSON.parse(json)) or
+ * reject(JSON.parse(json)). The result is queued and the machine's run loop is
+ * woken to settle on its own thread. Thread-safe. */
+void xsServiceResolve(void* bridge, uint32_t id, const char* json);
+void xsServiceReject(void* bridge, uint32_t id, const char* json);
 
 /* Stream one token (the reverse channel): invokes the call's JS
  * onToken(JSON.parse(json)) and keeps the call open until a later
- * xsBridgeComplete settles it. Thread-safe. */
-void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json);
+ * xsServiceResolve / xsServiceReject settles it. Thread-safe. */
+void xsServiceEmit(void* bridge, uint32_t id, const char* json);
 
 /* ---- Multi-machine services (Part D) ---- */
 
 /* Link `clientMachine` so its host functions can call services on
- * `serverMachine` (via xsBridgeServiceCall). Values cross as alien-marshalled
+ * `serverMachine` (via xsServiceInvoke). Values cross as alien-marshalled
  * data; the server exposes a global `__serviceHandler(method, args)`. Set up on
  * the XS thread (or before running). */
-void xsBridgeLinkService(void* clientMachine, void* serverMachine);
+void xsServiceLink(void* clientMachine, void* serverMachine);
 
 /* Install the service-server plumbing on `serverMachine` (the __serviceReply
  * host function + the __runService orchestrator). The consumer then sets a
  * global `__serviceHandler(method, args)` — synchronous or returning a Promise.
  * Run on the XS thread (via withMachine) before requests arrive. */
-void xsBridgeInstallServiceServer(void* machine);
+void xsServiceInstallServer(void* machine);
 
 /* ---- Introspection ---- */
 
@@ -125,7 +126,7 @@ int xsBridgeWriteSnapshot(void* machine, char** out, size_t* outLen);
  * or NULL. Must run on the target run-loop thread. */
 void* xsBridgeReadSnapshot(const char* bytes, size_t len);
 
-/* The XS-typed helpers for consumer C host-function targets (xsBridgePromise)
+/* The XS-typed helpers for consumer C host-function targets (xsServicePromise)
  * live in bridgeXS.h, which is NOT part of the clang module — include it
  * textually after xs.h in C translation units only. */
 
