@@ -393,24 +393,40 @@ do {
     let before = failures
     print("PHASE 7: multi-machine service (alien marshalling)")
     if let server = XSEngine(), let client = makeEngine() {
+        server.withMachine { xsBridgeInstallServiceServer($0) }
         _ = try? server.eval("""
             globalThis.__serviceHandler = function (method, args) {
+                if (method === 'asyncAdd')
+                    return new Promise(function (res) { res({ sum: args.x + args.y, async: true }); });
                 return { method: method, echoed: args, sum: (args.x || 0) + (args.y || 0) };
             };
             """)
         // Link client → server (pointer set; thread-agnostic).
         server.withMachine { s in client.withMachine { c in xsBridgeLinkService(c, s) } }
+
+        // Synchronous handler.
         _ = try? client.eval("""
-            globalThis.__result = 'pending';
+            globalThis.__r1 = 'pending';
             host.callService('add', { x: 2, y: 3 })
-                .then(function (r) { globalThis.__result = r; })
-                .catch(function (e) { globalThis.__result = { error: String(e) }; });
+                .then(function (r) { globalThis.__r1 = r; })
+                .catch(function (e) { globalThis.__r1 = { error: String(e) }; });
             """)
         client.runUntilIdle(timeout: 5)
-        let got = (try? client.eval("globalThis.__result")) ?? "<none>"
-        check("service round-trip (got \(got))",
-              got.contains("\"sum\":5") && got.contains("\"method\":\"add\"")
-              && got.contains("\"echoed\""))
+        let got1 = (try? client.eval("globalThis.__r1")) ?? "<none>"
+        check("sync service round-trip (got \(got1))",
+              got1.contains("\"sum\":5") && got1.contains("\"method\":\"add\""))
+
+        // Async (Promise-returning) handler.
+        _ = try? client.eval("""
+            globalThis.__r2 = 'pending';
+            host.callService('asyncAdd', { x: 4, y: 5 })
+                .then(function (r) { globalThis.__r2 = r; })
+                .catch(function (e) { globalThis.__r2 = { error: String(e) }; });
+            """)
+        client.runUntilIdle(timeout: 5)
+        let got2 = (try? client.eval("globalThis.__r2")) ?? "<none>"
+        check("async service round-trip (got \(got2))",
+              got2.contains("\"sum\":9") && got2.contains("\"async\":true"))
     } else {
         check("create two engines", false)
     }

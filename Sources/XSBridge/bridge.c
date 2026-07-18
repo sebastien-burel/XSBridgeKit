@@ -82,6 +82,7 @@ typedef struct XSBridge {
     xsMachine* machine;
     void* swiftContext;     /* opaque Swift pointer (xsBridgeSet/GetContext) */
     void* serviceTarget;    /* Part D: the XSBridge this machine calls as a service */
+    void* servicePending;   /* Part D: server-side in-flight requests (XSServicePending*) */
     uint32_t nextId;
     XSMessage* messages;   /* in-flight calls, XS-thread only */
 
@@ -883,6 +884,54 @@ typedef struct XSServiceEvent {
     void* blob;          /* alien-marshalled args (request) or value (reply), owned */
 } XSServiceEvent;
 
+/* Server-side record of an in-flight request: maps a server-local id to the
+ * client to reply to, so an async __serviceHandler can settle it later. */
+typedef struct XSServicePending {
+    uint32_t serverId;
+    XSBridge* client;
+    uint32_t clientCallId;
+    struct XSServicePending* next;
+} XSServicePending;
+
+static void xsServiceAddPending(XSBridge* server, uint32_t serverId,
+                                XSBridge* client, uint32_t clientCallId)
+{
+    XSServicePending* p = (XSServicePending*)calloc(1, sizeof(XSServicePending));
+    p->serverId = serverId;
+    p->client = client;
+    p->clientCallId = clientCallId;
+    p->next = (XSServicePending*)server->servicePending;
+    server->servicePending = p;
+}
+
+/* Unlink and return the pending record for serverId (caller frees), or NULL. */
+static XSServicePending* xsServiceTakePending(XSBridge* server, uint32_t serverId)
+{
+    XSServicePending** pp = (XSServicePending**)&server->servicePending;
+    while (*pp) {
+        if ((*pp)->serverId == serverId) {
+            XSServicePending* found = *pp;
+            *pp = found->next;
+            return found;
+        }
+        pp = &(*pp)->next;
+    }
+    return NULL;
+}
+
+/* Server-side orchestrator: wraps __serviceHandler in a promise so sync and
+ * async handlers settle uniformly, then hands the result (or error) back to C
+ * via __serviceReply(serverId, value, isError). */
+static const char* kServiceOrchestrator =
+    "globalThis.__runService = function(sid, method, args) {"
+    "  Promise.resolve().then(function() {"
+    "    if (typeof globalThis.__serviceHandler !== 'function')"
+    "      throw new Error('no __serviceHandler');"
+    "    return globalThis.__serviceHandler(method, args);"
+    "  }).then(function(v) { __serviceReply(sid, v, false); },"
+    "    function(e) { __serviceReply(sid, (e && e.message) || String(e), true); });"
+    "};";
+
 /* Client host helper: create the Promise on `the`, marshal args, post the
  * request to this machine's linked service target. Leaves xsResult = the
  * Promise. Must run in a host frame (a consumer host function). */
@@ -907,43 +956,74 @@ void xsBridgeServiceCall(xsMachine* the, const char* method, xsSlot* args)
     fxQueueWorkerJob(server->machine, j);
 }
 
-/* Runs on the SERVER machine's thread: demarshal args, invoke
- * __serviceHandler(method, args), marshal the result (or an error message),
- * post the reply back to the client machine. */
+/* C host function on the server: __serviceReply(serverId, value, isError).
+ * Marshals the settled value and posts the reply worker job to the client. */
+static void xs_service_reply(xsMachine* the)
+{
+    XSBridge* server = (XSBridge*)xsGetContext(the);
+    uint32_t serverId = (uint32_t)xsToInteger(xsArg(0));
+    int reject = xsToInteger(xsArg(2)) ? 1 : 0;
+    void* blob = xsMarshallAlien(xsArg(1));
+
+    XSServicePending* pend = xsServiceTakePending(server, serverId);
+    if (!pend) { free(blob); return; }
+
+    XSServiceEvent* r = (XSServiceEvent*)calloc(1, sizeof(XSServiceEvent));
+    r->job.callback = xsServicePerformReply;
+    r->reject = reject;
+    r->client = pend->client;
+    r->callId = pend->clientCallId;
+    r->blob = blob;
+    fxQueueWorkerJob(pend->client->machine, r);
+    free(pend);
+}
+
+/* Runs on the SERVER machine's thread: demarshal args, register the pending
+ * request and invoke __runService(serverId, method, args). The reply is posted
+ * later by __serviceReply, so both sync and async handlers work. */
 static void xsServicePerformRequest(void* machine, void* job_)
 {
     XSServiceEvent* j = (XSServiceEvent*)job_;
-    void* replyBlob = NULL;
-    int reject = 1;
+    XSBridge* server = (XSBridge*)xsGetContext((xsMachine*)machine);
+    uint32_t serverId = ++server->nextId;
+    int posted = 0;
+
+    xsServiceAddPending(server, serverId, j->client, j->callId);
 
     xsBeginHost((xsMachine*)machine);
     {
         xsVars(4);
         xsTry {
             xsVar(0) = xsDemarshallAlien(j->blob);            /* args */
-            xsVar(1) = xsGet(xsGlobal, xsID("__serviceHandler"));
-            xsVar(2) = xsString(j->method);
-            xsVar(3) = xsCallFunction2(xsVar(1), xsUndefined, xsVar(2), xsVar(0));
-            replyBlob = xsMarshallAlien(xsVar(3));
-            reject = 0;
+            xsVar(1) = xsGet(xsGlobal, xsID("__runService"));
+            xsVar(2) = xsInteger((int)serverId);
+            xsVar(3) = xsString(j->method);
+            xsCallFunction3(xsVar(1), xsUndefined, xsVar(2), xsVar(3), xsVar(0));
+            posted = 1;
         }
         xsCatch {
-            xsVar(0) = xsString("service handler error");
-            replyBlob = xsMarshallAlien(xsVar(0));
         }
+        xsBridgeDrainPromises(the);
     }
     xsEndHost((xsMachine*)machine);
 
     free(j->blob);
     free(j->method);
 
-    XSServiceEvent* r = (XSServiceEvent*)calloc(1, sizeof(XSServiceEvent));
-    r->job.callback = xsServicePerformReply;
-    r->reject = reject;
-    r->client = j->client;
-    r->callId = j->callId;
-    r->blob = replyBlob;
-    fxQueueWorkerJob(j->client->machine, r);
+    /* Orchestrator missing / threw before scheduling: settle as reject now. */
+    if (!posted) {
+        XSServicePending* pend = xsServiceTakePending(server, serverId);
+        if (pend) {
+            XSServiceEvent* r = (XSServiceEvent*)calloc(1, sizeof(XSServiceEvent));
+            r->job.callback = xsServicePerformReply;
+            r->reject = 1;
+            r->client = pend->client;
+            r->callId = pend->clientCallId;
+            r->blob = NULL;
+            fxQueueWorkerJob(pend->client->machine, r);
+            free(pend);
+        }
+    }
     /* mac_xs.c frees j */
 }
 
@@ -987,6 +1067,25 @@ void xsBridgeLinkService(void* clientMachine, void* serverMachine)
     XSBridge* c = (XSBridge*)((txMachine*)clientMachine)->context;
     XSBridge* s = (XSBridge*)((txMachine*)serverMachine)->context;
     c->serviceTarget = s;
+}
+
+/* Install the service-server plumbing (__serviceReply host function + the
+ * __runService orchestrator) on `serverMachine`. The consumer then sets its own
+ * global __serviceHandler(method, args) (may be sync or return a Promise). */
+void xsBridgeInstallServiceServer(void* machine)
+{
+    xsBeginHost((xsMachine*)machine);
+    {
+        xsVars(1);
+        xsTry {
+            xsVar(0) = xsNewHostFunction(xs_service_reply, 3);
+            xsSet(xsGlobal, xsID("__serviceReply"), xsVar(0));
+            xsCall1(xsGlobal, xsID("eval"), xsString(kServiceOrchestrator));
+        }
+        xsCatch {
+        }
+    }
+    xsEndHost((xsMachine*)machine);
 }
 
 /* ---------------------------------------------------------------------------

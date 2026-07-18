@@ -94,6 +94,12 @@ void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json);
  * the XS thread (or before running). */
 void xsBridgeLinkService(void* clientMachine, void* serverMachine);
 
+/* Install the service-server plumbing on `serverMachine` (the __serviceReply
+ * host function + the __runService orchestrator). The consumer then sets a
+ * global `__serviceHandler(method, args)` — synchronous or returning a Promise.
+ * Run on the XS thread (via withMachine) before requests arrive. */
+void xsBridgeInstallServiceServer(void* machine);
+
 /* ---- Introspection ---- */
 
 /* Number of in-flight async calls (ids awaiting settlement). XS-thread only. */
