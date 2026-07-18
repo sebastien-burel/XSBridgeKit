@@ -72,11 +72,14 @@ ServiceMessage* xsBridgeFindMessage(XSBridge* bridge, uint32_t id);
  * settled call's `await` continuation has run before pendingCount drops. */
 void xsBridgeDrainPromises(txMachine* the);
 
-/* Unified settle worker-job callbacks (txWorkerCallback). Used by BOTH peers:
- * the native peer posts them with an XSB_PAYLOAD_JSON event (xsServiceResolve /
- * xsServiceReject), the machine peer with an XSB_PAYLOAD_MARSHALLED event (the
- * service reply). Each unlinks the call, resolves/rejects, forgets its roots. */
+/* Unified settle worker-job callbacks (txWorkerCallback), defined in settle.c.
+ * Used by BOTH peers: the native peer posts them with an XSB_PAYLOAD_JSON event
+ * (xsServiceResolve / xsServiceReject), the machine peer with an
+ * XSB_PAYLOAD_MARSHALLED event (the service reply). Each unlinks the call,
+ * resolves/rejects, forgets its roots. ServiceEventToken streams one reverse-
+ * channel token (native peer only; machine services do not stream). */
 void ServiceEventResolve(void* machine, void* job);
 void ServiceEventReject(void* machine, void* job);
+void ServiceEventToken(void* machine, void* job);
 
 #endif /* bridgeInternal_h */

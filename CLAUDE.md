@@ -123,10 +123,11 @@ Sources/
     include/module.modulemap   # exposes bridge.h to Swift
     include/bridge.h           # flat C API, NO XS macros leak across it
     include/bridgeXS.h         # XS-typed helpers (xsServicePromise) — textual include for C targets, never Swift
-    include/bridgeInternal.h   # C-target internals shared by bridge.c + service.c (structs, ServiceEvent, settle callbacks) — never Swift
+    include/bridgeInternal.h   # C-target internals shared by settle.c/bridge.c/service.c (structs, ServiceEvent, settle callbacks) — never Swift
     xs/                        # symlinks to $MODDABLE/xs incl. platforms/mac_xs.c (git-ignored; see scripts/link-moddable.sh)
-    bridge.c                   # machine lifecycle, xsServicePromise, module loader, native-peer settlement via worker jobs (mac_xs.c)
-    service.c                  # machine↔machine service peer (alien-marshalled), reusing the same settle path
+    settle.c                   # shared async-call core: xsServicePromise + message list + the ServiceEvent settle callbacks (peer-neutral)
+    bridge.c                   # machine lifecycle, module loader, snapshot, and the NATIVE (Swift) peer (JSON posters) — depends on settle.c
+    service.c                  # the MACHINE↔MACHINE peer (alien-marshalled), reusing settle.c's callbacks — depends on settle.c
   XSBridgeKit/            # Swift library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
   xsBridgeTestC/          # C side of the demo host (consumer host-function pattern)
@@ -157,15 +158,17 @@ loop. The settle callback (`ServiceEventResolve` / `ServiceEventReject`, sharing
 the Promise, `fxForget`s, and **drains promise jobs** (`fxRunPromiseJobs` via
 `xsBridgeDrainPromises`) to resume the `await` continuation.
 
-**One settle path, two peers (the "service" layer).** The async settlement above is shared
-by both the native peer (Swift-backed host functions, `bridge.c`) and the machine peer
-(machine↔machine service calls, `service.c`). Both post a `ServiceEvent` handled by the
-same `ServiceEventResolve` / `ServiceEventReject` callbacks; the only difference is
-`ServiceEvent.payload` — the native peer carries the value as **UTF-8 JSON** (a Swift edge
-cannot `xsDemarshall`), the machine peer as an **alien-marshalled blob** (self-contained,
-by name, so two independent `xsCreateMachine` machines exchange it with no shared prep).
-Public API: `xsServicePromise` / `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit`
-(native), `xsServiceInvoke` / `xsServiceLink` / `xsServiceInstallServer` (machine).
+**One settle path, two peers (the "service" layer).** The async settlement above lives in
+`settle.c` — a peer-neutral core (`xsServicePromise` + the message list + the `ServiceEvent`
+callbacks `ServiceEventResolve`/`Reject`/`Token`) — reused by both the native peer (Swift-backed
+host functions, `bridge.c`) and the machine peer (machine↔machine service calls, `service.c`).
+Both `bridge.c` and `service.c` depend on `settle.c`, never on each other. Both post a
+`ServiceEvent` handled by the same callbacks; the only difference is `ServiceEvent.payload` —
+the native peer carries the value as **UTF-8 JSON** (a Swift edge cannot `xsDemarshall`), the
+machine peer as an **alien-marshalled blob** (self-contained, by name, so two independent
+`xsCreateMachine` machines exchange it with no shared prep). Public API: `xsServicePromise` /
+`xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (native), `xsServiceInvoke` /
+`xsServiceLink` / `xsServiceInstallServer` (machine).
 
 ## Critical invariants (must always hold)
 
