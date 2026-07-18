@@ -81,6 +81,7 @@ typedef struct XSEvent {
 typedef struct XSBridge {
     xsMachine* machine;
     void* swiftContext;     /* opaque Swift pointer (xsBridgeSet/GetContext) */
+    void* serviceTarget;    /* Part D: the XSBridge this machine calls as a service */
     uint32_t nextId;
     XSMessage* messages;   /* in-flight calls, XS-thread only */
 
@@ -93,6 +94,10 @@ typedef struct XSBridge {
 } XSBridge;
 
 static void xsBridgeEventPerform(void* machine, void* job);
+
+/* Part D: multi-machine service round-trip (alien marshalling over worker jobs). */
+static void xsServicePerformRequest(void* machine, void* job);
+static void xsServicePerformReply(void* machine, void* job);
 static void xsBridgeDrainPromises(txMachine* the);
 
 /* ---------------------------------------------------------------------------
@@ -852,6 +857,136 @@ void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json)
 void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json)
 {
     xsBridgeEventPost((XSBridge*)bridge, id, success ? XSB_RESOLVE : XSB_REJECT, json);
+}
+
+/* ---------------------------------------------------------------------------
+ * Part D: multi-machine service round-trip.
+ *
+ * A machine calls a service on another machine: it creates a Promise on itself
+ * (reusing xsBridgePromise's rooting + message list), alien-marshals the args
+ * and posts a request worker job to the target machine. The target demarshals,
+ * invokes its global __serviceHandler(method, args), alien-marshals the result
+ * (or an error) and posts a reply worker job back; the caller demarshals and
+ * settles the Promise. All value transfer is ALIEN marshalling (self-contained,
+ * by name) — so the two machines need no shared preparation (xsCreateMachine,
+ * not fxCloneMachine). The transport is mac_xs.c's fxQueueWorkerJob, the same
+ * primitive piuService's ServiceThreadSignal mirrors.
+ * ------------------------------------------------------------------------- */
+
+typedef struct XSServiceEvent {
+    txWorkerJob job;     /* must be first (mac_xs.c links/frees by this header) */
+    int reject;          /* reply: 0 resolve, 1 reject */
+    XSBridge* client;    /* the calling machine's bridge (settles the Promise) */
+    XSBridge* server;    /* the target machine's bridge (request only) */
+    uint32_t callId;
+    char* method;        /* request only, owned */
+    void* blob;          /* alien-marshalled args (request) or value (reply), owned */
+} XSServiceEvent;
+
+/* Client host helper: create the Promise on `the`, marshal args, post the
+ * request to this machine's linked service target. Leaves xsResult = the
+ * Promise. Must run in a host frame (a consumer host function). */
+void xsBridgeServiceCall(xsMachine* the, const char* method, xsSlot* args)
+{
+    XSBridge* client = (XSBridge*)xsGetContext(the);
+    XSBridge* server = (XSBridge*)client->serviceTarget;
+    if (!server) {
+        xsUnknownError("no service target linked");
+        return;
+    }
+    uint32_t id = xsBridgePromise(the, NULL);  /* roots resolve/reject; xsResult = promise */
+    void* blob = xsMarshallAlien(*args);
+
+    XSServiceEvent* j = (XSServiceEvent*)calloc(1, sizeof(XSServiceEvent));
+    j->job.callback = xsServicePerformRequest;
+    j->client = client;
+    j->server = server;
+    j->callId = id;
+    j->method = strdup(method ? method : "");
+    j->blob = blob;
+    fxQueueWorkerJob(server->machine, j);
+}
+
+/* Runs on the SERVER machine's thread: demarshal args, invoke
+ * __serviceHandler(method, args), marshal the result (or an error message),
+ * post the reply back to the client machine. */
+static void xsServicePerformRequest(void* machine, void* job_)
+{
+    XSServiceEvent* j = (XSServiceEvent*)job_;
+    void* replyBlob = NULL;
+    int reject = 1;
+
+    xsBeginHost((xsMachine*)machine);
+    {
+        xsVars(4);
+        xsTry {
+            xsVar(0) = xsDemarshallAlien(j->blob);            /* args */
+            xsVar(1) = xsGet(xsGlobal, xsID("__serviceHandler"));
+            xsVar(2) = xsString(j->method);
+            xsVar(3) = xsCallFunction2(xsVar(1), xsUndefined, xsVar(2), xsVar(0));
+            replyBlob = xsMarshallAlien(xsVar(3));
+            reject = 0;
+        }
+        xsCatch {
+            xsVar(0) = xsString("service handler error");
+            replyBlob = xsMarshallAlien(xsVar(0));
+        }
+    }
+    xsEndHost((xsMachine*)machine);
+
+    free(j->blob);
+    free(j->method);
+
+    XSServiceEvent* r = (XSServiceEvent*)calloc(1, sizeof(XSServiceEvent));
+    r->job.callback = xsServicePerformReply;
+    r->reject = reject;
+    r->client = j->client;
+    r->callId = j->callId;
+    r->blob = replyBlob;
+    fxQueueWorkerJob(j->client->machine, r);
+    /* mac_xs.c frees j */
+}
+
+/* Runs on the CLIENT machine's thread: demarshal the reply and settle the
+ * Promise (reusing the message list + rooting), then drain jobs. */
+static void xsServicePerformReply(void* machine, void* job_)
+{
+    XSServiceEvent* j = (XSServiceEvent*)job_;
+    XSBridge* client = j->client;
+
+    xsBeginHost((xsMachine*)machine);
+    {
+        xsVars(1);
+        XSMessage* rec = xsBridgeUnlinkMessage(client, j->callId);
+        if (rec) {
+            xsTry {
+                xsVar(0) = j->blob ? xsDemarshallAlien(j->blob) : xsUndefined;
+                if (j->reject)
+                    xsCallFunction1(xsAccess(rec->reject), xsUndefined, xsVar(0));
+                else
+                    xsCallFunction1(xsAccess(rec->resolve), xsUndefined, xsVar(0));
+            }
+            xsCatch {
+            }
+            fxForget(the, &rec->resolve);
+            fxForget(the, &rec->reject);
+            client->forgetCount += 2;
+            free(rec);
+        }
+        xsBridgeDrainPromises(the);
+    }
+    xsEndHost((xsMachine*)machine);
+
+    if (j->blob) free(j->blob);
+    /* mac_xs.c frees j */
+}
+
+/* Flat API: link `clientMachine` to call services on `serverMachine`. */
+void xsBridgeLinkService(void* clientMachine, void* serverMachine)
+{
+    XSBridge* c = (XSBridge*)((txMachine*)clientMachine)->context;
+    XSBridge* s = (XSBridge*)((txMachine*)serverMachine)->context;
+    c->serviceTarget = s;
 }
 
 /* ---------------------------------------------------------------------------

@@ -23,6 +23,13 @@ uint32_t xsBridgePromise(xsMachine* the, xsSlot* onToken);
  * xsBridgePromise. */
 char* xsBridgeArgJSON(xsMachine* the, int index);
 
+/* Part D: call a service on this machine's linked target machine. Creates the
+ * Promise on `the` (xsResult), alien-marshals `*args` and posts the request to
+ * the target (linked via xsBridgeLinkService); the target's global
+ * `__serviceHandler(method, args)` produces the result, marshalled back and
+ * used to settle the Promise. Call from inside a consumer host function. */
+void xsBridgeServiceCall(xsMachine* the, const char* method, xsSlot* args);
+
 /* One host function for the snapshot callback table (name = a stable label for
  * the prefix guard, not necessarily the JS property name). */
 typedef struct { const char* name; xsCallback callback; } XSBridgeHostFn;

@@ -386,4 +386,35 @@ do {
     phaseResult(6, before)
 }
 
+// PHASE 7: multi-machine service round-trip (Part D). A client machine calls a
+// service on a separate server machine; args and result cross as alien-
+// marshalled values over the worker-job transport — no shared preparation.
+do {
+    let before = failures
+    print("PHASE 7: multi-machine service (alien marshalling)")
+    if let server = XSEngine(), let client = makeEngine() {
+        _ = try? server.eval("""
+            globalThis.__serviceHandler = function (method, args) {
+                return { method: method, echoed: args, sum: (args.x || 0) + (args.y || 0) };
+            };
+            """)
+        // Link client → server (pointer set; thread-agnostic).
+        server.withMachine { s in client.withMachine { c in xsBridgeLinkService(c, s) } }
+        _ = try? client.eval("""
+            globalThis.__result = 'pending';
+            host.callService('add', { x: 2, y: 3 })
+                .then(function (r) { globalThis.__result = r; })
+                .catch(function (e) { globalThis.__result = { error: String(e) }; });
+            """)
+        client.runUntilIdle(timeout: 5)
+        let got = (try? client.eval("globalThis.__result")) ?? "<none>"
+        check("service round-trip (got \(got))",
+              got.contains("\"sum\":5") && got.contains("\"method\":\"add\"")
+              && got.contains("\"echoed\""))
+    } else {
+        check("create two engines", false)
+    }
+    phaseResult(7, before)
+}
+
 exit(failures == 0 ? 0 : 1)

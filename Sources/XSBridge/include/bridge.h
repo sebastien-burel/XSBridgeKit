@@ -86,6 +86,14 @@ void xsBridgeComplete(void* bridge, uint32_t id, int success, const char* json);
  * xsBridgeComplete settles it. Thread-safe. */
 void xsBridgeEmitToken(void* bridge, uint32_t id, const char* json);
 
+/* ---- Multi-machine services (Part D) ---- */
+
+/* Link `clientMachine` so its host functions can call services on
+ * `serverMachine` (via xsBridgeServiceCall). Values cross as alien-marshalled
+ * data; the server exposes a global `__serviceHandler(method, args)`. Set up on
+ * the XS thread (or before running). */
+void xsBridgeLinkService(void* clientMachine, void* serverMachine);
+
 /* ---- Introspection ---- */
 
 /* Number of in-flight async calls (ids awaiting settlement). XS-thread only. */
