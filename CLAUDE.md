@@ -31,8 +31,8 @@ for async calls — creates its Promise via `xsBridgePromise` (declared in `brid
 then hands `(bridge, id, params)` to its Swift `@_cdecl` counterpart; Swift settles later
 with `xsBridgeComplete` / `xsBridgeEmitToken`. There is no JS prelude, no string-keyed
 dispatch, no Swift protocol: the pair `xsBridgeTestC/demoHost.c` + `DemoHost.swift`
-(echo/stream/fail/add) is the reference pattern, kept as the regression suite; the
-`xsBridgeCli`/`xsBridgeCliC` sandbox shows the minimal version (getCurrentTime).
+(echo/stream/fail/add, plus a multi-machine service call) is the reference pattern, kept
+as the regression suite.
 
 **Dedicated-thread runtime.** Each `XSEngine` owns a private background `Thread` with its
 own `CFRunLoop` (`RunLoopThread`). The machine is created on it; every machine access is
@@ -132,8 +132,6 @@ Sources/
   xsBridgeTest/           # Swift executable: runner + test harness
     DemoHost.swift             # Swift side of the demo host: @_cdecl entry points (regression suite)
     main.swift                 # runs the test agents, asserts, exits non-zero on any failure
-  xsBridgeCliC/           # C side of the CLI sandbox (print, getCurrentTime)
-  xsBridgeCli/            # Swift executable: sandbox for experiments (eval / runModule)
 agents/                   # JS test scripts: echo.js, stream.js, concurrent.js, error.js, sequential.js
 scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE into Sources/XSBridge/xs/
 ```
@@ -178,7 +176,6 @@ export MODDABLE=/path/to/moddable
 ./scripts/link-moddable.sh          # symlinks the XS sources into Sources/XSBridge/xs/
 swift build -c release              # builds in release on Apple Silicon
 swift run xsBridgeTest              # runs the harness; exits non-zero if any criterion fails
-swift run xsBridgeCli [file.js]     # sandbox: inline demo, or runs file.js as an ES module
 ```
 
 `main.swift` runs each agent, asserts its criterion, and exits non-zero on failure —

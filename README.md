@@ -18,7 +18,9 @@ const sum = host.add(2, 3);                   // synchronous Swift call → 5
 
 The engine also loads **ES modules** from disk (`.js`/`.mjs`, and `.xsb` bytecode compiled
 by `xsc`), invokes a module's `default` export as a repeatable entry point, and can
-**snapshot** its whole heap to persist state across process launches.
+**snapshot** its whole heap to persist state across process launches. Several engines can
+also **call each other as services** — one machine `await`s a method on another, values
+crossing between them as structured (alien-marshalled) data — with no shared preparation.
 
 ## Install
 
@@ -102,7 +104,7 @@ func myEcho(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32, _ json: UnsafePoin
 
 ```swift
 import XSBridgeKit
-import XSBridgeCliC   // whatever module exposes MyHostInstall
+import YourHostC      // your C module exposing MyHostInstall
 
 guard let engine = XSEngine() else { fatalError("engine init failed") }
 engine.withMachine { MyHostInstall($0) }        // install host functions on the XS thread
@@ -131,6 +133,8 @@ try engine.runModule("agent.js", params: #"{"n":5}"#)  // default(JSON.parse(par
 | `engine.writeSnapshot()` | Serialize the whole JS heap to `Data` (requires idle). |
 | `engine.withMachine { … }` | Run C on the XS thread with the opaque machine handle (install hook). |
 | `engine.pendingCount` | Number of in-flight async calls. |
+| `engine.installServiceServer()` | Make this engine answer cross-machine calls (set a global `__serviceHandler`). |
+| `engine.linkService(to:)` | Let this engine's host functions call services on another engine (`xsBridgeServiceCall`). |
 | `XSCreation` | VM sizing (heap/stack/key counts) with validated defaults. |
 | `XSError` | A JS error surfaced to Swift as a message (never a crash). |
 | `xsBridgePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
@@ -145,13 +149,21 @@ table once (`xsBridgeRegisterHostTable`); each snapshot carries its ordered name
 restore accepts a prefix-compatible superset (append safe, reorder/removal rejected). Write
 requires the engine to be idle (`pendingCount == 0`).
 
-The `xsBridgeCli` sandbox exposes it:
-
-```sh
-swift run -c release xsBridgeCli --snapshot vm.xsbk init.js   # run, then write vm.xsbk
-swift run -c release xsBridgeCli --restore vm.xsbk act.js     # restore (new process), run
-swift run -c release xsBridgeCli --restore vm.xsbk --snapshot vm.xsbk act.js  # persist a session
+```swift
+let bytes = try engine.writeSnapshot()   // requires pendingCount == 0
+// … later, in a fresh process (after registering the same host table):
+let restored = XSEngine(snapshot: bytes)
 ```
+
+## Multi-machine services
+
+Several engines can call each other. Mark one engine as a server
+(`installServiceServer()`, then set a global `__serviceHandler(method, args)` — synchronous
+or returning a Promise); link a client engine to it (`linkService(to:)`). A client host
+function then calls `xsBridgeServiceCall(the, method, &args)`; the argument and result cross
+as **alien-marshalled** values (self-contained, so the machines need no shared preparation —
+`xsCreateMachine`, not clone), settling the caller's `await`. This is how an agent can spawn
+and delegate to a sub-agent running on its own engine, JS-to-JS.
 
 ## Invariants
 
@@ -188,13 +200,12 @@ git-ignored. Build flags live in `Package.swift`; the engine itself is not built
 
 ## Build & run
 
-`xsBridgeTest` is a CLI harness whose demo host (echo / stream / fail / add) doubles as the
-regression suite; `xsBridgeCli` is a sandbox for running JS files and modules:
+`xsBridgeTest` is a CLI harness whose demo host (echo / stream / fail / add, plus a
+multi-machine service phase) doubles as the regression suite:
 
 ```sh
 swift build -c release
-swift run -c release xsBridgeTest        # 6-phase suite; exits non-zero if any check fails
-swift run -c release xsBridgeCli file.js # run a JS file as an ES module
+swift run -c release xsBridgeTest        # multi-phase suite; exits non-zero if any check fails
 ```
 
 ## License

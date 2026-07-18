@@ -60,20 +60,10 @@ let package = Package(
             dependencies: ["XSBridge"],
             cSettings: consumerHeaderPaths + xsDefines
         ),
-        // Test harness / demo (the 6-phase regression suite).
+        // Test harness / demo (the multi-phase regression suite).
         .executableTarget(
             name: "xsBridgeTest",
             dependencies: ["XSBridgeKit", "XSBridge", "xsBridgeTestC"]
-        ),
-        // C side of the CLI sandbox: host functions written against xs.h.
-        .target(
-            name: "xsBridgeCliC",
-            dependencies: ["XSBridge"],
-            cSettings: consumerHeaderPaths + xsDefines
-        ),
-        .executableTarget(
-            name: "xsBridgeCli",
-            dependencies: ["XSBridgeKit", "XSBridge", "xsBridgeCliC"]
         ),
     ]
 )
