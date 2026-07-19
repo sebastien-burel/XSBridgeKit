@@ -280,6 +280,8 @@ static void ServiceEventInvokeModule(void* machine, void* job_)
 static const char* kThreadServicePrelude =
     "globalThis.Thread = function Thread(name) { return __spawnThread(name); };"
     "globalThis.Service = function Service(thread, module) {"
+    "  if ((module.charAt(0) === '.') && globalThis.__moduleBase)"
+    "    module = globalThis.__moduleBase + '/' + module;"   /* child realpath()s the '.'/'..' away */
     "  const handle = __serviceCreate(thread, module);"
     "  const handler = {"
     "    thread: thread, handle: handle,"   /* keep the child engine + proxy record reachable */

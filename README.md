@@ -170,13 +170,15 @@ Instead of wiring engines from Swift, a script can spawn and call its own sub-ag
 `xsBridgeRegisterThreadFactory`) to add two globals:
 
 ```js
-const t   = new Thread("worker");            // spawns a child engine (own machine + thread)
-const svc = new Service(t, "/abs/agent.mjs"); // a Proxy bound to a module in that child
+const t   = new Thread("worker");             // spawns a child engine (own machine + thread)
+const svc = new Service(t, "./agent.mjs");    // a Proxy bound to a module in that child
 const r   = await svc.query({ q: "…" });      // Promise made in JS; args/result alien-marshalled
 ```
 
 The child `import()`s the module and calls its **default export**'s method; the result
-settles the `await`. A `Thread` is a host object whose destructor tears the child engine
+settles the `await`. The module specifier is either absolute or **relative** — a `./` or
+`../` specifier resolves against `globalThis.__moduleBase` (set to the running script's own
+directory by the runtime), so an agent references sibling modules naturally. A `Thread` is a host object whose destructor tears the child engine
 down when it is garbage-collected, so lifecycle follows JS reachability — who spawns, how
 many, and how they are named all live in the script. The factory is consumer-supplied
 because the socle installs no host capabilities.

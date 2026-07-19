@@ -436,11 +436,13 @@ do {
 
     if let engine = makeEngine() {
         engine.withMachine { xsThreadInstall($0) }
+        // A relative module specifier resolves against globalThis.__moduleBase.
         let script = """
+        globalThis.__moduleBase = '\(moduleURL.deletingLastPathComponent().path)';
         globalThis.__r = 'pending';
         (async function () {
             const t = new Thread('worker');
-            const svc = new Service(t, '\(moduleURL.path)');
+            const svc = new Service(t, './\(moduleURL.lastPathComponent)');
             const a = await svc.double({ n: 21 });   // sync handler
             const b = await svc.greet({ who: 'tykaoz' });  // Promise handler
             globalThis.__r = { a: a, b: b };

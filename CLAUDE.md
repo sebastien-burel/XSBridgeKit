@@ -178,9 +178,12 @@ spawns a fully-installed child engine (a consumer-supplied factory registered vi
 svc.method(args)` creates the Promise **in JS**, hands its resolve/reject to
 `__serviceInvoke` (rooted in a `ServiceMessage`, reusing `settle.c`), marshals the args and
 posts a request. The child `import(moduleSpecifier)`s the module and calls its default
-export; the reply settles through the same `ServiceEventResolve`/`Reject` path. A `Thread`
-is a host object whose destructor tears the child engine down when it is GC'd, so lifecycle
-follows JS reachability. Who spawns, how many, and how they are named lives in the script.
+export; the reply settles through the same `ServiceEventResolve`/`Reject` path. A relative
+(`./` / `../`) specifier is resolved against `globalThis.__moduleBase` in the `Service`
+prelude (the child then `realpath`s it), so the runtime sets `__moduleBase` to the script's
+directory. A `Thread` is a host object whose destructor tears the child engine down when it
+is GC'd, so lifecycle follows JS reachability. Who spawns, how many, and how they are named
+lives in the script.
 
 ## Critical invariants (must always hold)
 
