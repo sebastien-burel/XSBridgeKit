@@ -133,12 +133,12 @@ try engine.runModule("agent.js", params: #"{"n":5}"#)  // default(JSON.parse(par
 | `engine.writeSnapshot()` | Serialize the whole JS heap to `Data` (requires idle). |
 | `engine.withMachine { … }` | Run C on the XS thread with the opaque machine handle (install hook). |
 | `engine.pendingCount` | Number of in-flight async calls. |
-| `engine.installServiceServer()` | Make this engine answer cross-machine calls (set a global `__serviceHandler`). |
-| `engine.linkService(to:)` | Let this engine's host functions call services on another engine (`xsServiceInvoke`). |
+| `engine.installThreads()` | Add the `Thread`/`Service` globals so the script can spawn + call child engines. |
 | `XSCreation` | VM sizing (heap/stack/key counts) with validated defaults. |
 | `XSError` | A JS error surfaced to Swift as a message (never a crash). |
 | `xsServicePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
 | `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (C, `bridge.h`) | Settle / stream an async call from any thread. |
+| `xsThreadInstall` / `xsBridgeRegisterThreadFactory` (C, `bridge.h`) | Add the `Thread`/`Service` globals (JS-initiated spawn) / register the child-engine factory. |
 
 ## Snapshots (persist / restore)
 
@@ -157,15 +157,29 @@ let restored = XSEngine(snapshot: bytes)
 
 ## Multi-machine services
 
-Several engines can call each other. Mark one engine as a server
-(`installServiceServer()`, then set a global `__serviceHandler(method, args)` — synchronous
-or returning a Promise); link a client engine to it (`linkService(to:)`). A client host
-function then calls `xsServiceInvoke(the, method, &args)`; the argument and result cross
-as **alien-marshalled** values (self-contained, so the machines need no shared preparation —
-`xsCreateMachine`, not clone), settling the caller's `await`. Under the hood this reuses the
-same settlement path as native calls (`ServiceEventResolve`/`Reject`) — only the payload
-differs (alien blob vs JSON). This is how an agent can spawn and delegate to a sub-agent
-running on its own engine, JS-to-JS.
+Several engines can call each other, JS-to-JS. Values cross as **alien-marshalled** data
+(self-contained, so the machines need no shared preparation — `xsCreateMachine`, not clone),
+and settle the caller's `await` through the same settlement path as native calls
+(`ServiceEventResolve`/`Reject`) — only the payload differs (alien blob vs JSON). The whole
+topology is initiated from the script, via the `Thread` / `Service` globals below.
+
+### JS-initiated spawn: `Thread` / `Service`
+
+Instead of wiring engines from Swift, a script can spawn and call its own sub-agents. Call
+`xsThreadInstall(machine)` (after registering a child-engine factory with
+`xsBridgeRegisterThreadFactory`) to add two globals:
+
+```js
+const t   = new Thread("worker");            // spawns a child engine (own machine + thread)
+const svc = new Service(t, "/abs/agent.mjs"); // a Proxy bound to a module in that child
+const r   = await svc.query({ q: "…" });      // Promise made in JS; args/result alien-marshalled
+```
+
+The child `import()`s the module and calls its **default export**'s method; the result
+settles the `await`. A `Thread` is a host object whose destructor tears the child engine
+down when it is garbage-collected, so lifecycle follows JS reachability — who spawns, how
+many, and how they are named all live in the script. The factory is consumer-supplied
+because the socle installs no host capabilities.
 
 ## Invariants
 

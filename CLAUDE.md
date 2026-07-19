@@ -127,7 +127,7 @@ Sources/
     xs/                        # symlinks to $MODDABLE/xs incl. platforms/mac_xs.c (git-ignored; see scripts/link-moddable.sh)
     settle.c                   # shared async-call core: xsServicePromise + message list + the ServiceEvent settle callbacks (peer-neutral)
     bridge.c                   # machine lifecycle, module loader, snapshot, and the NATIVE (Swift) peer (JSON posters) — depends on settle.c
-    service.c                  # the MACHINE↔MACHINE peer (alien-marshalled), reusing settle.c's callbacks — depends on settle.c
+    service.c                  # the MACHINE↔MACHINE peer (alien-marshalled) + JS-initiated Thread/Service spawn — depends on settle.c
   XSBridgeKit/            # Swift library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
   xsBridgeTestC/          # C side of the demo host (consumer host-function pattern)
@@ -167,8 +167,20 @@ Both `bridge.c` and `service.c` depend on `settle.c`, never on each other. Both 
 the native peer carries the value as **UTF-8 JSON** (a Swift edge cannot `xsDemarshall`), the
 machine peer as an **alien-marshalled blob** (self-contained, by name, so two independent
 `xsCreateMachine` machines exchange it with no shared prep). Public API: `xsServicePromise` /
-`xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (native), `xsServiceInvoke` /
-`xsServiceLink` / `xsServiceInstallServer` (machine).
+`xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (native peer); the machine peer is
+driven from JS via `xsThreadInstall`'s `Thread` / `Service` globals (below).
+
+**JS-initiated spawn (`Thread` / `Service`).** The machine peer is driven entirely from
+the script (the piu model). `xsThreadInstall(machine)` adds two globals: `new Thread(name)`
+spawns a fully-installed child engine (a consumer-supplied factory registered via
+`xsBridgeRegisterThreadFactory` builds it — the socle installs nothing), and
+`new Service(thread, moduleSpecifier)` returns a `Proxy` bound to that child; `await
+svc.method(args)` creates the Promise **in JS**, hands its resolve/reject to
+`__serviceInvoke` (rooted in a `ServiceMessage`, reusing `settle.c`), marshals the args and
+posts a request. The child `import(moduleSpecifier)`s the module and calls its default
+export; the reply settles through the same `ServiceEventResolve`/`Reject` path. A `Thread`
+is a host object whose destructor tears the child engine down when it is GC'd, so lifecycle
+follows JS reachability. Who spawns, how many, and how they are named lives in the script.
 
 ## Critical invariants (must always hold)
 

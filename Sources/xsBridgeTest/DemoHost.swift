@@ -5,6 +5,8 @@
 // its own C+Swift pair mapping host functions to tools and LLM providers.
 
 import XSBridge
+import XSBridgeKit
+import XSBridgeTestC
 import Foundation
 
 enum DemoHost {
@@ -65,4 +67,42 @@ func xsbDemoStream(_ bridge: UnsafeMutableRawPointer?, _ id: UInt32) {
         Thread.sleep(forTimeInterval: DemoHost.streamLatency)
         xsServiceResolve(bridge, id, DemoHost.jsonString(full))
     }
+}
+
+/// Thread factory for the harness: JS `new Thread(name)` in any engine spawns a
+/// child XSEngine here, installed with the demo host + the Thread/Service
+/// globals so it can itself serve and spawn. Children are retained by their
+/// machine pointer and released — torn down — when the parent's Thread object is
+/// garbage-collected (its host destructor calls `destroy`).
+enum DemoThreads {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var children: [UnsafeMutableRawPointer: XSEngine] = [:]
+    nonisolated(unsafe) private static var created = 0
+    nonisolated(unsafe) private static var destroyed = 0
+
+    static let create: @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutableRawPointer? = { _ in
+        guard let child = XSEngine() else { return nil }
+        let machine = child.withMachine { $0 }
+        child.withMachine { xsThreadInstall($0) }
+        child.withMachine { xsBridgeTestInstall($0) }
+        lock.lock()
+        children[machine] = child
+        created += 1
+        lock.unlock()
+        return machine
+    }
+
+    static let destroy: @convention(c) (UnsafeMutableRawPointer?) -> Void = { machine in
+        guard let machine else { return }
+        lock.lock()
+        let engine = children.removeValue(forKey: machine)
+        destroyed += 1
+        lock.unlock()
+        _ = engine   // deinit (child thread teardown) runs here, after the unlock
+    }
+
+    static func register() { xsBridgeRegisterThreadFactory(create, destroy) }
+    static func resetCounters() { lock.lock(); created = 0; destroyed = 0; lock.unlock() }
+    static var createdCount: Int { lock.lock(); defer { lock.unlock() }; return created }
+    static var destroyedCount: Int { lock.lock(); defer { lock.unlock() }; return destroyed }
 }

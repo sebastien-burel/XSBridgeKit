@@ -87,19 +87,23 @@ void xsServiceReject(void* bridge, uint32_t id, const char* json);
  * xsServiceResolve / xsServiceReject settles it. Thread-safe. */
 void xsServiceEmit(void* bridge, uint32_t id, const char* json);
 
-/* ---- Multi-machine services (Part D) ---- */
+/* ---- JS-initiated threads (Thread / Service globals) ---- */
 
-/* Link `clientMachine` so its host functions can call services on
- * `serverMachine` (via xsServiceInvoke). Values cross as alien-marshalled
- * data; the server exposes a global `__serviceHandler(method, args)`. Set up on
- * the XS thread (or before running). */
-void xsServiceLink(void* clientMachine, void* serverMachine);
+/* A consumer-provided factory for child engines spawned by JS `new Thread(name)`.
+ * `create` must return a fully-installed child machine (its own machine+thread,
+ * as from xsBridgeCreateMachine, with the consumer's host functions AND
+ * xsThreadInstall so it can itself serve / spawn); `destroy` tears it down. The
+ * factory is consumer-supplied because the socle installs no host capabilities.
+ * `create` runs on the parent's XS thread (inside `new Thread`); it must create
+ * and return synchronously. Registered once, process-wide, like the host table. */
+typedef void* (*XSThreadCreate)(const char* name);
+typedef void  (*XSThreadDestroy)(void* childMachine);
+void xsBridgeRegisterThreadFactory(XSThreadCreate create, XSThreadDestroy destroy);
 
-/* Install the service-server plumbing on `serverMachine` (the __serviceReply
- * host function + the __runService orchestrator). The consumer then sets a
- * global `__serviceHandler(method, args)` — synchronous or returning a Promise.
- * Run on the XS thread (via withMachine) before requests arrive. */
-void xsServiceInstallServer(void* machine);
+/* Install the `Thread` (and `Service`) globals on `machine`, so its JS can spawn
+ * child engines and call them as services — everything initiated from the
+ * script. Requires a thread factory registered. Run on the XS thread. */
+void xsThreadInstall(void* machine);
 
 /* ---- Introspection ---- */
 
