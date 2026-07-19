@@ -101,6 +101,24 @@ void xsServiceLink(void* clientMachine, void* serverMachine);
  * Run on the XS thread (via withMachine) before requests arrive. */
 void xsServiceInstallServer(void* machine);
 
+/* ---- JS-initiated threads (Thread / Service globals) ---- */
+
+/* A consumer-provided factory for child engines spawned by JS `new Thread(name)`.
+ * `create` must return a fully-installed child machine (its own machine+thread,
+ * as from xsBridgeCreateMachine, with the consumer's host functions AND
+ * xsThreadInstall so it can itself serve / spawn); `destroy` tears it down. The
+ * factory is consumer-supplied because the socle installs no host capabilities.
+ * `create` runs on the parent's XS thread (inside `new Thread`); it must create
+ * and return synchronously. Registered once, process-wide, like the host table. */
+typedef void* (*XSThreadCreate)(const char* name);
+typedef void  (*XSThreadDestroy)(void* childMachine);
+void xsBridgeRegisterThreadFactory(XSThreadCreate create, XSThreadDestroy destroy);
+
+/* Install the `Thread` (and `Service`) globals on `machine`, so its JS can spawn
+ * child engines and call them as services — everything initiated from the
+ * script. Requires a thread factory registered. Run on the XS thread. */
+void xsThreadInstall(void* machine);
+
 /* ---- Introspection ---- */
 
 /* Number of in-flight async calls (ids awaiting settlement). XS-thread only. */

@@ -54,6 +54,10 @@ func makeEngine() -> XSEngine? {
     return engine
 }
 
+// Register the harness thread factory once: JS `new Thread(...)` spawns a child
+// engine through it (see PHASE 8).
+DemoThreads.register()
+
 func check(_ label: String, _ condition: Bool) {
     print("  [\(condition ? "ok" : "XX")] \(label)")
     if !condition { failures += 1 }
@@ -440,6 +444,81 @@ do {
         check("create two engines", false)
     }
     phaseResult(7, before)
+}
+
+// PHASE 8: JS-initiated thread spawn + GC teardown (the Thread primitive). A
+// script creates child engines with `new Thread(...)`; unreferenced, they are
+// collected and their host destructor tears the child engine down — everything
+// initiated from JS, machine lifecycle owned by Swift's factory.
+do {
+    let before = failures
+    print("PHASE 8: JS Thread spawn + teardown")
+    DemoThreads.resetCounters()
+    if let engine = makeEngine() {
+        engine.withMachine { xsThreadInstall($0) }
+        _ = try? engine.eval("(function () { new Thread('w1'); new Thread('w2'); })(); 0")
+        check("2 child engines spawned (\(DemoThreads.createdCount))",
+              DemoThreads.createdCount == 2)
+        // The Thread objects are unreferenced; a full GC finalizes them, and
+        // each host destructor tears its child engine down.
+        engine.withMachine { xsBridgeCollectGarbage($0) }
+        engine.withMachine { xsBridgeCollectGarbage($0) }
+        check("both child engines torn down after GC (\(DemoThreads.destroyedCount))",
+              DemoThreads.destroyedCount == 2)
+    } else {
+        check("create engine", false)
+    }
+    phaseResult(8, before)
+}
+
+// PHASE 9: JS-initiated Service round-trip. A supervisor script spawns a child
+// engine (`new Thread`), binds a `Service` to a module, and `await`s methods on
+// it — args and result cross as alien-marshalled values; the child imports the
+// module and runs its default export. Everything is initiated from the script.
+do {
+    let before = failures
+    print("PHASE 9: JS Thread + Service round-trip")
+    // Source = a module (imported by the child via an absolute specifier).
+    let moduleURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("xsb-service-\(getpid()).mjs")
+    let moduleSrc = """
+    export default {
+        double({ n }) { return { doubled: n * 2 }; },
+        greet({ who }) { return new Promise(function (r) { r({ hello: who }); }); }
+    };
+    """
+    try? moduleSrc.write(to: moduleURL, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: moduleURL) }
+
+    if let engine = makeEngine() {
+        engine.withMachine { xsThreadInstall($0) }
+        let script = """
+        globalThis.__r = 'pending';
+        (async function () {
+            const t = new Thread('worker');
+            const svc = new Service(t, '\(moduleURL.path)');
+            const a = await svc.double({ n: 21 });   // sync handler
+            const b = await svc.greet({ who: 'tykaoz' });  // Promise handler
+            globalThis.__r = { a: a, b: b };
+        })().catch(function (e) { globalThis.__r = { error: String((e && e.stack) || e) }; });
+        """
+        _ = try? engine.eval(script)
+        engine.runUntilIdle(timeout: 5)
+        let got = (try? engine.eval("globalThis.__r")) ?? "<none>"
+        check("service round-trip via Thread+Service (got \(got))",
+              got.contains("\"doubled\":42") && got.contains("\"hello\":\"tykaoz\""))
+        // Invariant #4: the client rooted resolve/reject per call and forgot them
+        // at settle — balanced, and no call left pending.
+        engine.withMachine { m in
+            var remembered: UInt32 = 0, forgotten: UInt32 = 0
+            xsBridgeDebugCounts(m, &remembered, &forgotten)
+            check("client roots balanced (\(remembered) == \(forgotten))", remembered == forgotten)
+            check("client idle (pending == 0)", xsBridgePendingCount(m) == 0)
+        }
+    } else {
+        check("create engine", false)
+    }
+    phaseResult(9, before)
 }
 
 exit(failures == 0 ? 0 : 1)

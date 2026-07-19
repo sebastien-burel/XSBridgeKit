@@ -61,6 +61,7 @@ typedef struct ServiceEvent {
     void* blob;            /* alien-marshalled value (owned) — XSB_PAYLOAD_MARSHALLED */
     struct XSBridge* client;   /* service request only: the bridge to reply to */
     char* method;          /* service request only: method name (owned) */
+    char* module;          /* Thread/Service request only: module specifier (owned) */
 } ServiceEvent;
 
 /* Message-list bookkeeping (XS-thread only). Unlink removes and returns the

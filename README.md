@@ -139,6 +139,7 @@ try engine.runModule("agent.js", params: #"{"n":5}"#)  // default(JSON.parse(par
 | `XSError` | A JS error surfaced to Swift as a message (never a crash). |
 | `xsServicePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
 | `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (C, `bridge.h`) | Settle / stream an async call from any thread. |
+| `xsThreadInstall` / `xsBridgeRegisterThreadFactory` (C, `bridge.h`) | Add the `Thread`/`Service` globals (JS-initiated spawn) / register the child-engine factory. |
 
 ## Snapshots (persist / restore)
 
@@ -166,6 +167,24 @@ as **alien-marshalled** values (self-contained, so the machines need no shared p
 same settlement path as native calls (`ServiceEventResolve`/`Reject`) — only the payload
 differs (alien blob vs JSON). This is how an agent can spawn and delegate to a sub-agent
 running on its own engine, JS-to-JS.
+
+### JS-initiated spawn: `Thread` / `Service`
+
+Instead of wiring engines from Swift, a script can spawn and call its own sub-agents. Call
+`xsThreadInstall(machine)` (after registering a child-engine factory with
+`xsBridgeRegisterThreadFactory`) to add two globals:
+
+```js
+const t   = new Thread("worker");            // spawns a child engine (own machine + thread)
+const svc = new Service(t, "/abs/agent.mjs"); // a Proxy bound to a module in that child
+const r   = await svc.query({ q: "…" });      // Promise made in JS; args/result alien-marshalled
+```
+
+The child `import()`s the module and calls its **default export**'s method; the result
+settles the `await`. A `Thread` is a host object whose destructor tears the child engine
+down when it is garbage-collected, so lifecycle follows JS reachability — who spawns, how
+many, and how they are named all live in the script. The factory is consumer-supplied
+because the socle installs no host capabilities.
 
 ## Invariants
 
