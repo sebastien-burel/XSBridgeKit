@@ -55,7 +55,7 @@ func makeEngine() -> XSEngine? {
 }
 
 // Register the harness thread factory once: JS `new Thread(...)` spawns a child
-// engine through it (see PHASE 8).
+// engine through it (see PHASE 7).
 DemoThreads.register()
 
 func check(_ label: String, _ condition: Bool) {
@@ -390,69 +390,13 @@ do {
     phaseResult(6, before)
 }
 
-// PHASE 7: multi-machine service round-trip (Part D). A client machine calls a
-// service on a separate server machine; args and result cross as alien-
-// marshalled values over the worker-job transport — no shared preparation.
-do {
-    let before = failures
-    print("PHASE 7: multi-machine service (alien marshalling)")
-    if let server = XSEngine(), let client = makeEngine() {
-        // Swift multi-machine API (D2): install the server plumbing + link.
-        server.installServiceServer()
-        _ = try? server.eval("""
-            globalThis.__serviceHandler = function (method, args) {
-                if (method === 'asyncAdd')
-                    return new Promise(function (res) { res({ sum: args.x + args.y, async: true }); });
-                return { method: method, echoed: args, sum: (args.x || 0) + (args.y || 0) };
-            };
-            """)
-        client.linkService(to: server)
-
-        // JS Proxy ergonomics (D2): `service.method(args)` over host.callService.
-        _ = try? client.eval("""
-            globalThis.service = new Proxy({}, {
-                get: function (target, method) {
-                    return function (args) { return host.callService(String(method), args); };
-                }
-            });
-            """)
-
-        // Synchronous handler, called as service.add(...).
-        _ = try? client.eval("""
-            globalThis.__r1 = 'pending';
-            service.add({ x: 2, y: 3 })
-                .then(function (r) { globalThis.__r1 = r; })
-                .catch(function (e) { globalThis.__r1 = { error: String(e) }; });
-            """)
-        client.runUntilIdle(timeout: 5)
-        let got1 = (try? client.eval("globalThis.__r1")) ?? "<none>"
-        check("sync service via proxy (got \(got1))",
-              got1.contains("\"sum\":5") && got1.contains("\"method\":\"add\""))
-
-        // Async (Promise-returning) handler, called as service.asyncAdd(...).
-        _ = try? client.eval("""
-            globalThis.__r2 = 'pending';
-            service.asyncAdd({ x: 4, y: 5 })
-                .then(function (r) { globalThis.__r2 = r; })
-                .catch(function (e) { globalThis.__r2 = { error: String(e) }; });
-            """)
-        client.runUntilIdle(timeout: 5)
-        let got2 = (try? client.eval("globalThis.__r2")) ?? "<none>"
-        check("async service via proxy (got \(got2))",
-              got2.contains("\"sum\":9") && got2.contains("\"async\":true"))
-    } else {
-        check("create two engines", false)
-    }
-    phaseResult(7, before)
-}
-
-// PHASE 8: JS-initiated thread spawn + GC teardown (the Thread primitive). A
+// PHASE 7: JS-initiated thread spawn + GC teardown (the Thread primitive). A
 // script creates child engines with `new Thread(...)`; unreferenced, they are
 // collected and their host destructor tears the child engine down — everything
 // initiated from JS, machine lifecycle owned by Swift's factory.
 do {
     let before = failures
-    print("PHASE 8: JS Thread spawn + teardown")
+    print("PHASE 7: JS Thread spawn + teardown")
     DemoThreads.resetCounters()
     if let engine = makeEngine() {
         engine.withMachine { xsThreadInstall($0) }
@@ -468,16 +412,16 @@ do {
     } else {
         check("create engine", false)
     }
-    phaseResult(8, before)
+    phaseResult(7, before)
 }
 
-// PHASE 9: JS-initiated Service round-trip. A supervisor script spawns a child
+// PHASE 8: JS-initiated Service round-trip. A supervisor script spawns a child
 // engine (`new Thread`), binds a `Service` to a module, and `await`s methods on
 // it — args and result cross as alien-marshalled values; the child imports the
 // module and runs its default export. Everything is initiated from the script.
 do {
     let before = failures
-    print("PHASE 9: JS Thread + Service round-trip")
+    print("PHASE 8: JS Thread + Service round-trip")
     // Source = a module (imported by the child via an absolute specifier).
     let moduleURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("xsb-service-\(getpid()).mjs")
@@ -518,7 +462,7 @@ do {
     } else {
         check("create engine", false)
     }
-    phaseResult(9, before)
+    phaseResult(8, before)
 }
 
 exit(failures == 0 ? 0 : 1)

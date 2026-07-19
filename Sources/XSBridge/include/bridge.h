@@ -87,20 +87,6 @@ void xsServiceReject(void* bridge, uint32_t id, const char* json);
  * xsServiceResolve / xsServiceReject settles it. Thread-safe. */
 void xsServiceEmit(void* bridge, uint32_t id, const char* json);
 
-/* ---- Multi-machine services (Part D) ---- */
-
-/* Link `clientMachine` so its host functions can call services on
- * `serverMachine` (via xsServiceInvoke). Values cross as alien-marshalled
- * data; the server exposes a global `__serviceHandler(method, args)`. Set up on
- * the XS thread (or before running). */
-void xsServiceLink(void* clientMachine, void* serverMachine);
-
-/* Install the service-server plumbing on `serverMachine` (the __serviceReply
- * host function + the __runService orchestrator). The consumer then sets a
- * global `__serviceHandler(method, args)` — synchronous or returning a Promise.
- * Run on the XS thread (via withMachine) before requests arrive. */
-void xsServiceInstallServer(void* machine);
-
 /* ---- JS-initiated threads (Thread / Service globals) ---- */
 
 /* A consumer-provided factory for child engines spawned by JS `new Thread(name)`.

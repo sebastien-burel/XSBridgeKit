@@ -35,7 +35,6 @@ typedef struct ServiceMessage {
 typedef struct XSBridge {
     xsMachine* machine;
     void* swiftContext;     /* opaque Swift pointer (xsBridgeSet/GetContext) */
-    void* serviceTarget;    /* service: the XSBridge this machine calls as a peer */
     void* servicePending;   /* service: server-side in-flight requests (ServicePending*) */
     uint32_t nextId;
     ServiceMessage* messages;   /* in-flight calls, XS-thread only */

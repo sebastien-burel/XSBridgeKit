@@ -98,14 +98,6 @@ static void xs_demo_stream(xsMachine* the)
     xsbDemoStream(bridge, id);
 }
 
-/* host.callService(method, args) — Part D: calls a service on the linked target
- * machine; args and the result cross as alien-marshalled values. */
-static void xs_demo_service_call(xsMachine* the)
-{
-    const char* method = xsToString(xsArg(0));
-    xsServiceInvoke(the, method, &xsArg(1));   /* xsResult = the promise */
-}
-
 void xsBridgeTestInstall(void* machine)
 {
     xs_demo_reset_outputs();
@@ -130,9 +122,6 @@ void xsBridgeTestInstall(void* machine)
 
             xsVar(1) = xsNewHostFunction(xs_demo_add, 2);
             xsSet(xsVar(0), xsID("add"), xsVar(1));
-
-            xsVar(1) = xsNewHostFunction(xs_demo_service_call, 2);
-            xsSet(xsVar(0), xsID("callService"), xsVar(1));
         }
         xsCatch {
         }

@@ -167,8 +167,8 @@ Both `bridge.c` and `service.c` depend on `settle.c`, never on each other. Both 
 the native peer carries the value as **UTF-8 JSON** (a Swift edge cannot `xsDemarshall`), the
 machine peer as an **alien-marshalled blob** (self-contained, by name, so two independent
 `xsCreateMachine` machines exchange it with no shared prep). Public API: `xsServicePromise` /
-`xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (native), `xsServiceInvoke` /
-`xsServiceLink` / `xsServiceInstallServer` (machine).
+`xsServiceResolve` / `xsServiceReject` / `xsServiceEmit` (native peer); the machine peer is
+driven from JS via `xsThreadInstall`'s `Thread` / `Service` globals (below).
 
 **JS-initiated spawn (`Thread` / `Service`).** The machine peer is driven entirely from
 the script (the piu model). `xsThreadInstall(machine)` adds two globals: `new Thread(name)`

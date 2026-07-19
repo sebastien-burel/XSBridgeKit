@@ -133,8 +133,7 @@ try engine.runModule("agent.js", params: #"{"n":5}"#)  // default(JSON.parse(par
 | `engine.writeSnapshot()` | Serialize the whole JS heap to `Data` (requires idle). |
 | `engine.withMachine { … }` | Run C on the XS thread with the opaque machine handle (install hook). |
 | `engine.pendingCount` | Number of in-flight async calls. |
-| `engine.installServiceServer()` | Make this engine answer cross-machine calls (set a global `__serviceHandler`). |
-| `engine.linkService(to:)` | Let this engine's host functions call services on another engine (`xsServiceInvoke`). |
+| `engine.installThreads()` | Add the `Thread`/`Service` globals so the script can spawn + call child engines. |
 | `XSCreation` | VM sizing (heap/stack/key counts) with validated defaults. |
 | `XSError` | A JS error surfaced to Swift as a message (never a crash). |
 | `xsServicePromise` / `xsBridgeArgJSON` (C, `bridgeXS.h`) | Create an async call's Promise / stringify an argument. |
@@ -158,15 +157,11 @@ let restored = XSEngine(snapshot: bytes)
 
 ## Multi-machine services
 
-Several engines can call each other. Mark one engine as a server
-(`installServiceServer()`, then set a global `__serviceHandler(method, args)` — synchronous
-or returning a Promise); link a client engine to it (`linkService(to:)`). A client host
-function then calls `xsServiceInvoke(the, method, &args)`; the argument and result cross
-as **alien-marshalled** values (self-contained, so the machines need no shared preparation —
-`xsCreateMachine`, not clone), settling the caller's `await`. Under the hood this reuses the
-same settlement path as native calls (`ServiceEventResolve`/`Reject`) — only the payload
-differs (alien blob vs JSON). This is how an agent can spawn and delegate to a sub-agent
-running on its own engine, JS-to-JS.
+Several engines can call each other, JS-to-JS. Values cross as **alien-marshalled** data
+(self-contained, so the machines need no shared preparation — `xsCreateMachine`, not clone),
+and settle the caller's `await` through the same settlement path as native calls
+(`ServiceEventResolve`/`Reject`) — only the payload differs (alien blob vs JSON). The whole
+topology is initiated from the script, via the `Thread` / `Service` globals below.
 
 ### JS-initiated spawn: `Thread` / `Service`
 
