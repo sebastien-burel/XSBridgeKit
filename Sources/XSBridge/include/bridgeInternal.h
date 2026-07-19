@@ -82,4 +82,9 @@ void ServiceEventResolve(void* machine, void* job);
 void ServiceEventReject(void* machine, void* job);
 void ServiceEventToken(void* machine, void* job);
 
+/* Free the server-side in-flight request list (bridge->servicePending), owned by
+ * service.c. Called from xsBridgeDeleteMachine so a torn-down server machine
+ * with unanswered requests leaks nothing. */
+void xsServiceFreePending(XSBridge* bridge);
+
 #endif /* bridgeInternal_h */

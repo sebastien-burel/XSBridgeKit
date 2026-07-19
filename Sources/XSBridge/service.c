@@ -59,6 +59,20 @@ static ServicePending* ServiceTakePending(XSBridge* server, uint32_t serverId)
     return NULL;
 }
 
+/* Free every server-side in-flight request record (machine delete). Any client
+ * awaiting these requests never gets a reply — but that Promise dies with the
+ * whole graph the caller is tearing down, so there is nothing to settle. */
+void xsServiceFreePending(XSBridge* bridge)
+{
+    ServicePending* p = (ServicePending*)bridge->servicePending;
+    while (p) {
+        ServicePending* n = p->next;
+        free(p);
+        p = n;
+    }
+    bridge->servicePending = NULL;
+}
+
 /* Post a reply worker job to the client, settling its Promise via bridge.c's
  * shared machine-peer settle callback (marshalled payload). */
 static void ServicePostReply(XSBridge* client, uint32_t clientCallId,

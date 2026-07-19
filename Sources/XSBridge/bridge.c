@@ -443,6 +443,7 @@ void xsBridgeDeleteMachine(void* machine)
     free(p);
     p = n;
   }
+  xsServiceFreePending(bridge);   /* server-side in-flight requests (service.c) */
   free(bridge->moduleError);
   free(bridge->moduleParams);
   free(bridge);
