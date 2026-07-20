@@ -82,54 +82,161 @@ char* xsBridgeArgJSON(xsMachine* the, int index)
  * Module (no mxProgramFlag). A miss surfaces to JS as module-not-found.
  * ------------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * Module roots (process-wide, Moddable-style). A root maps a prefix to a
+ * directory: prefix "" is a default root for un-prefixed bare specifiers
+ * (several allowed, searched in registration order); a named prefix maps
+ * `<prefix>/x` to `<dir>/x`. When any root is registered the loader runs in
+ * "rooted" mode — a bare specifier resolves against the roots with `.xsb` →
+ * `.mjs` → `.js` extension search, and EVERY resolution (relative `./`/`../`
+ * included) must land inside a root (no escaping the sandbox). With no roots
+ * registered the loader keeps its plain realpath behaviour (back-compat).
+ * ------------------------------------------------------------------------- */
+
+typedef struct ModuleRoot {
+    struct ModuleRoot* next;
+    char* prefix;   /* "" for a default root */
+    char* dir;      /* absolute (realpath'd) directory, no trailing separator */
+} ModuleRoot;
+
+static ModuleRoot* gModuleRoots = NULL;
+
+void xsBridgeClearModuleRoots(void)
+{
+    ModuleRoot* p = gModuleRoots;
+    while (p) {
+        ModuleRoot* n = p->next;
+        free(p->prefix);
+        free(p->dir);
+        free(p);
+        p = n;
+    }
+    gModuleRoots = NULL;
+}
+
+void xsBridgeAddModuleRoot(const char* prefix, const char* dir)
+{
+    char real[C_PATH_MAX];
+    if (!dir || !c_realpath(dir, real))
+        return;                                    /* skip a missing directory */
+    const char* pfx = prefix ? prefix : "";
+    for (ModuleRoot* r = gModuleRoots; r; r = r->next)     /* idempotent */
+        if (!c_strcmp(r->prefix, pfx) && !c_strcmp(r->dir, real))
+            return;
+    ModuleRoot* root = (ModuleRoot*)calloc(1, sizeof(ModuleRoot));
+    root->prefix = strdup(pfx);
+    root->dir = strdup(real);
+    ModuleRoot** pp = &gModuleRoots;               /* append, keep order */
+    while (*pp) pp = &(*pp)->next;
+    *pp = root;
+}
+
+/* True if the absolute `path` is `dir` itself or a descendant of it. */
+static int fxPathInside(const char* path, const char* dir)
+{
+    size_t n = strlen(dir);
+    if (strncmp(path, dir, n) != 0)
+        return 0;
+    return path[n] == 0 || path[n] == mxSeparator;
+}
+
+/* Confinement: with roots configured, a resolved path must sit inside one. */
+static int fxModuleAllowed(const char* real)
+{
+    if (!gModuleRoots)
+        return 1;
+    for (ModuleRoot* r = gModuleRoots; r; r = r->next)
+        if (fxPathInside(real, r->dir))
+            return 1;
+    return 0;
+}
+
+/* Try `base` verbatim (hasExt) or with each known extension in order; realpath
+ * into `out`. Returns 1 (and fills `out`) on the first file that exists. */
+static int fxResolveWithExt(const char* base, int hasExt, char* out)
+{
+    if (hasExt)
+        return c_realpath(base, out) ? 1 : 0;
+    static const char* const exts[] = { ".xsb", ".mjs", ".js" };
+    char cand[C_PATH_MAX];
+    for (int i = 0; i < 3; i++) {
+        c_strcpy(cand, base);
+        c_strcat(cand, exts[i]);
+        if (c_realpath(cand, out))
+            return 1;
+    }
+    return 0;
+}
+
 txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
 {
     char name[C_PATH_MAX];
-    char buffer[C_PATH_MAX];
+    char base[C_PATH_MAX];
     char real[C_PATH_MAX];
-    char extension[5] = "";
-    txInteger dot = 0;
     txString slash;
-    txString path;
     fxToStringBuffer(the, slot, name, sizeof(name));
-    if (name[0] == '.') {
-        if (name[1] == '/')
-            dot = 1;
-        else if ((name[1] == '.') && (name[2] == '/'))
-            dot = 2;
-    }
+
+    /* Does the specifier already carry a module extension? */
     slash = c_strrchr(name, mxSeparator);
-    if (!slash)
-        slash = name;
+    if (!slash) slash = name;
     slash = c_strrchr(slash, '.');
-    if (slash && (!c_strcmp(slash, ".js") || !c_strcmp(slash, ".mjs") || !c_strcmp(slash, ".xsb"))) {
-        c_strcpy(extension, slash);
-        *slash = 0;
+    int hasExt = slash && (!c_strcmp(slash, ".js") || !c_strcmp(slash, ".mjs")
+                           || !c_strcmp(slash, ".xsb"));
+
+    int dot = 0;
+    if (name[0] == '.') {
+        if (name[1] == '/') dot = 1;
+        else if (name[1] == '.' && name[2] == '/') dot = 2;
     }
+
     if (dot) {
+        /* Relative to the importer's directory (drop 1 or 2 components), then
+         * extension-search + confine. */
         if (moduleID == XS_NO_ID)
             return XS_NO_ID;
-        /* Prepend a separator so strrchr always finds one, then replace the
-         * importer's last component(s) with the relative specifier. */
-        buffer[0] = mxSeparator;
-        path = buffer + 1;
-        c_strcpy(path, fxGetKeyName(the, moduleID));
-        slash = c_strrchr(buffer, mxSeparator);
-        if (!slash)
-            return XS_NO_ID;
+        base[0] = mxSeparator;
+        c_strcpy(base + 1, fxGetKeyName(the, moduleID));
+        slash = c_strrchr(base, mxSeparator);
+        if (!slash) return XS_NO_ID;
         if (dot == 2) {
             *slash = 0;
-            slash = c_strrchr(buffer, mxSeparator);
-            if (!slash)
-                return XS_NO_ID;
+            slash = c_strrchr(base, mxSeparator);
+            if (!slash) return XS_NO_ID;
         }
         *slash = 0;
-        c_strcat(buffer, name + dot);
+        c_strcat(base, name + dot);
+        if (fxResolveWithExt(base + 1, hasExt, real) && fxModuleAllowed(real))
+            return fxNewNameC(the, real);
+        return XS_NO_ID;
     }
-    else
-        path = name;
-    c_strcat(path, extension);
-    if (c_realpath(path, real))
+
+    if (gModuleRoots) {
+        /* Bare specifier — resolve against a named or default root, then
+         * confine (a `../` in the remainder can't escape the root set). */
+        for (ModuleRoot* r = gModuleRoots; r; r = r->next) {
+            const char* rest;
+            if (r->prefix[0] == 0) {
+                rest = name;
+            }
+            else {
+                size_t pl = strlen(r->prefix);
+                if (strncmp(name, r->prefix, pl) != 0 || name[pl] != mxSeparator)
+                    continue;
+                rest = name + pl + 1;
+            }
+            c_strcpy(base, r->dir);
+            size_t bl = strlen(base);
+            base[bl] = mxSeparator;
+            base[bl + 1] = 0;
+            c_strcat(base, rest);
+            if (fxResolveWithExt(base, hasExt, real) && fxModuleAllowed(real))
+                return fxNewNameC(the, real);
+        }
+        return XS_NO_ID;
+    }
+
+    /* No roots configured — legacy behaviour: realpath the specifier as-is. */
+    if (c_realpath(name, real))
         return fxNewNameC(the, real);
     return XS_NO_ID;
 }

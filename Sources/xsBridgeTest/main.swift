@@ -467,4 +467,58 @@ do {
     phaseResult(8, before)
 }
 
+// PHASE 9: module roots (Moddable-style). A registered root resolves bare
+// specifiers (no `./`, no extension — `.xsb`/`.mjs`/`.js` searched), a named
+// prefix maps to an external directory, and resolution is confined to the roots.
+do {
+    let before = failures
+    print("PHASE 9: module roots (bare specifiers + confinement)")
+    let fm = FileManager.default
+    let baseDir = fm.temporaryDirectory.appendingPathComponent("xsb-roots-\(getpid())")
+    let root = baseDir.appendingPathComponent("root")
+    let sub = root.appendingPathComponent("sub")
+    let lib = baseDir.appendingPathComponent("lib")
+    try? fm.createDirectory(at: sub, withIntermediateDirectories: true)
+    try? fm.createDirectory(at: lib, withIntermediateDirectories: true)
+    // greeter (bare, extension-less), sub/util (subdir), lib/tool (named root),
+    // and a secret OUTSIDE both roots that a `..` escape must not reach.
+    try? "export default \"hi from greeter\";".write(
+        to: root.appendingPathComponent("greeter.mjs"), atomically: true, encoding: .utf8)
+    try? "export default 7;".write(
+        to: sub.appendingPathComponent("util.mjs"), atomically: true, encoding: .utf8)
+    try? "export default \"lib tool\";".write(
+        to: lib.appendingPathComponent("tool.mjs"), atomically: true, encoding: .utf8)
+    try? "export default \"LEAKED\";".write(
+        to: baseDir.appendingPathComponent("secret.mjs"), atomically: true, encoding: .utf8)
+    defer { try? fm.removeItem(at: baseDir) }
+
+    if let engine = makeEngine() {
+        engine.withMachine { _ in
+            xsBridgeAddModuleRoot("", root.path)
+            xsBridgeAddModuleRoot("lib", lib.path)
+        }
+        _ = try? engine.eval("""
+            globalThis.__r = {};
+            Promise.all([
+                import("greeter").then(function (m) { __r.bare = m.default; }),
+                import("sub/util").then(function (m) { __r.subdir = m.default; }),
+                import("lib/tool").then(function (m) { __r.named = m.default; }),
+                import("lib/../../secret")
+                    .then(function (m) { __r.escape = "LOADED:" + m.default; })
+                    .catch(function () { __r.escape = "blocked"; }),
+            ]).catch(function () {});
+            """)
+        engine.runUntilIdle(timeout: 5)
+        let got = (try? engine.eval("globalThis.__r")) ?? "<none>"
+        check("bare specifier resolves (.mjs) — \(got)", got.contains("\"bare\":\"hi from greeter\""))
+        check("bare subdir resolves", got.contains("\"subdir\":7"))
+        check("named root prefix resolves", got.contains("\"named\":\"lib tool\""))
+        check("`..` escape is confined (blocked)", got.contains("\"escape\":\"blocked\""))
+        engine.withMachine { _ in xsBridgeClearModuleRoots() }
+    } else {
+        check("create engine", false)
+    }
+    phaseResult(9, before)
+}
+
 exit(failures == 0 ? 0 : 1)

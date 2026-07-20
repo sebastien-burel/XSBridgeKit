@@ -185,6 +185,16 @@ directory. A `Thread` is a host object whose destructor tears the child engine d
 is GC'd, so lifecycle follows JS reachability. Who spawns, how many, and how they are named
 lives in the script.
 
+**Module resolution (roots).** The filesystem loader (`fxFindModule` in `bridge.c`) resolves
+a relative (`./`, `../`) specifier against the importer, as ES expects. On top of that a
+consumer can register **roots** (`xsBridgeAddModuleRoot(prefix, dir)`, process-wide): a `""`
+prefix is a default root for **bare** specifiers (`import "util"` → `<root>/util.{xsb,mjs,js}`,
+searched in that order), a named prefix maps `<prefix>/x` to an external directory
+(`import "modules/x"`). While any root is registered the loader is **confined** — every
+resolution, relative ones included, must land inside a root (no `../` escape) — mirroring
+Moddable's `mcconfig` layout. With no root registered the loader keeps its plain realpath
+behaviour, so this is opt-in. (`.xsa` archive roots are a planned follow-up.)
+
 ## Critical invariants (must always hold)
 
 1. **No XS exception crosses a Swift frame.** All `xsTry`/`xsCatch` stays in C; every
