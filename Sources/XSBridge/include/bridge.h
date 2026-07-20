@@ -74,6 +74,19 @@ void xsBridgeRunModule(void* machine, const char* path, const char* paramsJSON);
  * When rejected, *out_err = the message (free with xsBridgeFree). XS-thread only. */
 int xsBridgeModuleStatus(void* machine, char** out_err);
 
+/* ---- Module roots (Moddable-style bare specifiers, process-wide) ---- */
+
+/* Register a module-resolution root. `prefix` "" is a default root for
+ * un-prefixed bare specifiers (`import "util"`); several defaults are searched
+ * in registration order. A named prefix maps `<prefix>/x` to `<dir>/x`
+ * (`import "modules/x"`). While any root is registered, bare specifiers resolve
+ * against the roots with `.xsb`/`.mjs`/`.js` extension search, and every
+ * resolution (relative ones included) is confined inside the root set. With no
+ * root registered the loader keeps its plain realpath behaviour. Idempotent;
+ * `dir` is resolved once and skipped if missing. */
+void xsBridgeAddModuleRoot(const char* prefix, const char* dir);
+void xsBridgeClearModuleRoots(void);
+
 /* ---- Async settlement (from Swift background threads) ---- */
 
 /* Settle an in-flight native call by id: resolve(JSON.parse(json)) or
