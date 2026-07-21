@@ -497,6 +497,10 @@ do {
             xsBridgeAddModuleRoot("", root.path)
             xsBridgeAddModuleRoot("lib", lib.path)
         }
+        // An absolute path OUTSIDE the roots still resolves (the bundle-import
+        // case: framework engines share the process-wide roots but load their
+        // own resources by absolute path) — confinement governs bare/relative.
+        let absSecret = baseDir.appendingPathComponent("secret.mjs").path
         _ = try? engine.eval("""
             globalThis.__r = {};
             Promise.all([
@@ -506,6 +510,9 @@ do {
                 import("lib/../../secret")
                     .then(function (m) { __r.escape = "LOADED:" + m.default; })
                     .catch(function () { __r.escape = "blocked"; }),
+                import("\(absSecret)")
+                    .then(function (m) { __r.abs = m.default; })
+                    .catch(function () { __r.abs = "blocked"; }),
             ]).catch(function () {});
             """)
         engine.runUntilIdle(timeout: 5)
@@ -514,6 +521,7 @@ do {
         check("bare subdir resolves", got.contains("\"subdir\":7"))
         check("named root prefix resolves", got.contains("\"named\":\"lib tool\""))
         check("`..` escape is confined (blocked)", got.contains("\"escape\":\"blocked\""))
+        check("absolute path resolves despite roots (bundle case)", got.contains("\"abs\":\"LEAKED\""))
         engine.withMachine { _ in xsBridgeClearModuleRoots() }
     } else {
         check("create engine", false)

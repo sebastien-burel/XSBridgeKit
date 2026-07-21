@@ -81,9 +81,11 @@ int xsBridgeModuleStatus(void* machine, char** out_err);
  * in registration order. A named prefix maps `<prefix>/x` to `<dir>/x`
  * (`import "modules/x"`). While any root is registered, bare specifiers resolve
  * against the roots with `.xsb`/`.mjs`/`.js` extension search, and every
- * resolution (relative ones included) is confined inside the root set. With no
- * root registered the loader keeps its plain realpath behaviour. Idempotent;
- * `dir` is resolved once and skipped if missing. */
+ * resolution (relative ones included) is confined inside the root set. An
+ * absolute-path specifier is exempt — it always realpaths as-is (bundle
+ * resources loaded by framework engines sharing this process-wide registry).
+ * With no root registered the loader keeps its plain realpath behaviour.
+ * Idempotent; `dir` is resolved once and skipped if missing. */
 void xsBridgeAddModuleRoot(const char* prefix, const char* dir);
 void xsBridgeClearModuleRoots(void);
 
