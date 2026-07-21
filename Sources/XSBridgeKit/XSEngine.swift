@@ -7,10 +7,13 @@
 import XSBridge
 import Foundation
 
-public struct XSError: Error, CustomStringConvertible {
+public struct XSError: Error, CustomStringConvertible, LocalizedError {
   public let message: String
   public init(message: String) { self.message = message }
   public var description: String { message }
+  // Without this, `.localizedDescription` bridges to the useless generic
+  // "operation couldn't be completed (XSError error 1)", hiding `message`.
+  public var errorDescription: String? { message }
 }
 
 /// A dedicated thread running a CFRunLoop, onto which work is submitted and run
