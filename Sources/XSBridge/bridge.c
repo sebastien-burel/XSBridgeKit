@@ -151,6 +151,56 @@ static int fxModuleAllowed(const char* real)
     return 0;
 }
 
+/* Trusted absolute-path prefixes — directories the framework itself loads
+ * modules from by absolute path (its own bundle resources). Because roots are
+ * process-wide, a confined agent's roots also govern the framework's own
+ * engines (a JS provider, tool bundle, a sub-agent's orchestrator), which
+ * import bundle resources by absolute path. Those must keep working, but an
+ * agent must NOT be able to import an arbitrary absolute path (a `/etc/...`
+ * escape). So an absolute specifier is allowed only inside a registered root
+ * OR inside one of these trusted prefixes; nothing else. */
+typedef struct TrustedPrefix {
+    struct TrustedPrefix* next;
+    char* dir;
+} TrustedPrefix;
+
+static TrustedPrefix* gTrustedPrefixes = NULL;
+
+void xsBridgeClearTrustedModulePrefixes(void)
+{
+    TrustedPrefix* p = gTrustedPrefixes;
+    while (p) {
+        TrustedPrefix* n = p->next;
+        free(p->dir);
+        free(p);
+        p = n;
+    }
+    gTrustedPrefixes = NULL;
+}
+
+void xsBridgeAddTrustedModulePrefix(const char* dir)
+{
+    char real[C_PATH_MAX];
+    if (!dir || !c_realpath(dir, real))
+        return;
+    for (TrustedPrefix* t = gTrustedPrefixes; t; t = t->next)   /* idempotent */
+        if (!c_strcmp(t->dir, real))
+            return;
+    TrustedPrefix* tp = (TrustedPrefix*)calloc(1, sizeof(TrustedPrefix));
+    tp->dir = strdup(real);
+    tp->next = gTrustedPrefixes;
+    gTrustedPrefixes = tp;
+}
+
+/* True if the resolved `real` sits inside a trusted framework prefix. */
+static int fxPathTrusted(const char* real)
+{
+    for (TrustedPrefix* t = gTrustedPrefixes; t; t = t->next)
+        if (fxPathInside(real, t->dir))
+            return 1;
+    return 0;
+}
+
 /* Try `base` verbatim (hasExt) or with each known extension in order; realpath
  * into `out`. Returns 1 (and fills `out`) on the first file that exists. */
 static int fxResolveWithExt(const char* base, int hasExt, char* out)
@@ -212,12 +262,14 @@ txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
 
     if (name[0] == mxSeparator) {
         /* An absolute path is an explicit, fully-qualified specifier — e.g. a
-         * bundle resource imported by the framework's own (non-agent) engines,
-         * which share this process-wide root registry. Realpath it as-is,
-         * independent of any roots: roots + confinement govern bare and relative
-         * specifiers only (a `/abs/path` is not a bare name to resolve, and
-         * confining it would break every bundle import while an agent runs). */
-        if (c_realpath(name, real))
+         * bundle resource imported by the framework's own engines, which share
+         * this process-wide root registry. Realpath it, then allow it only if
+         * it lands inside a registered root OR a trusted framework prefix: that
+         * keeps bundle imports working while an agent's roots are registered,
+         * yet still confines the agent (a `/etc/...` absolute escape resolves to
+         * neither, so it is rejected). With no roots registered fxModuleAllowed
+         * is permissive, preserving the plain realpath back-compat. */
+        if (c_realpath(name, real) && (fxModuleAllowed(real) || fxPathTrusted(real)))
             return fxNewNameC(the, real);
         return XS_NO_ID;
     }

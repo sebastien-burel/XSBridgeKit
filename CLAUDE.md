@@ -192,12 +192,14 @@ prefix is a default root for **bare** specifiers (`import "util"` → `<root>/ut
 searched in that order), a named prefix maps `<prefix>/x` to an external directory
 (`import "modules/x"`). While any root is registered the loader is **confined** — every
 bare/relative resolution (relative ones included) must land inside a root (no `../` escape) —
-mirroring Moddable's `mcconfig` layout. An **absolute-path** specifier is exempt: it always
-realpaths as-is, because the roots are process-wide and framework engines (a JS provider,
-tool bundle) import their own bundle resources by absolute path — confining those would break
-them mid-run; confinement targets the agent's bare/relative imports. With no root registered
-the loader keeps its plain realpath behaviour, so this is opt-in. (`.xsa` archive roots are a
-planned follow-up.)
+mirroring Moddable's `mcconfig` layout. An **absolute-path** specifier resolves only if it
+lands inside a root **or** a registered **trusted prefix** (`xsBridgeAddTrustedModulePrefix`):
+the roots are process-wide, so a confined agent's roots also govern the framework's own
+engines (a JS provider, tool bundle, a sub-agent's orchestrator) which import their bundle
+resources by absolute path — the consumer marks that bundle directory trusted so those imports
+survive, while an agent's arbitrary `/abs/path` escape (in neither a root nor a trusted prefix)
+is still rejected. With no root registered the loader keeps its plain realpath behaviour, so
+this is opt-in. (`.xsa` archive roots are a planned follow-up.)
 
 ## Critical invariants (must always hold)
 

@@ -82,12 +82,22 @@ int xsBridgeModuleStatus(void* machine, char** out_err);
  * (`import "modules/x"`). While any root is registered, bare specifiers resolve
  * against the roots with `.xsb`/`.mjs`/`.js` extension search, and every
  * resolution (relative ones included) is confined inside the root set. An
- * absolute-path specifier is exempt — it always realpaths as-is (bundle
- * resources loaded by framework engines sharing this process-wide registry).
+ * absolute-path specifier is allowed only if it resolves inside a registered
+ * root OR a trusted prefix (below) — so an agent cannot escape via `/abs/path`.
  * With no root registered the loader keeps its plain realpath behaviour.
  * Idempotent; `dir` is resolved once and skipped if missing. */
 void xsBridgeAddModuleRoot(const char* prefix, const char* dir);
 void xsBridgeClearModuleRoots(void);
+
+/* Register a trusted absolute-path prefix (process-wide). The framework loads
+ * its own bundled modules by absolute path; since roots are process-wide, a
+ * confined agent's roots would otherwise block those framework imports (a JS
+ * provider, tool bundle, a sub-agent's orchestrator). Absolute specifiers that
+ * resolve inside a trusted prefix are exempt from root confinement — but only
+ * those; an agent's arbitrary absolute import stays blocked. Point this at the
+ * framework's bundle resource directory once at startup. Idempotent. */
+void xsBridgeAddTrustedModulePrefix(const char* dir);
+void xsBridgeClearTrustedModulePrefixes(void);
 
 /* ---- Async settlement (from Swift background threads) ---- */
 

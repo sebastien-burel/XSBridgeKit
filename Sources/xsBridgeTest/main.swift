@@ -478,10 +478,14 @@ do {
     let root = baseDir.appendingPathComponent("root")
     let sub = root.appendingPathComponent("sub")
     let lib = baseDir.appendingPathComponent("lib")
+    let trusted = baseDir.appendingPathComponent("trusted")
     try? fm.createDirectory(at: sub, withIntermediateDirectories: true)
     try? fm.createDirectory(at: lib, withIntermediateDirectories: true)
+    try? fm.createDirectory(at: trusted, withIntermediateDirectories: true)
     // greeter (bare, extension-less), sub/util (subdir), lib/tool (named root),
-    // and a secret OUTSIDE both roots that a `..` escape must not reach.
+    // a secret OUTSIDE every root/prefix (a `..` escape AND a bare absolute path
+    // must be blocked), and a trusted/bundle simulating a framework resource
+    // loaded by absolute path (must resolve despite confinement).
     try? "export default \"hi from greeter\";".write(
         to: root.appendingPathComponent("greeter.mjs"), atomically: true, encoding: .utf8)
     try? "export default 7;".write(
@@ -490,17 +494,21 @@ do {
         to: lib.appendingPathComponent("tool.mjs"), atomically: true, encoding: .utf8)
     try? "export default \"LEAKED\";".write(
         to: baseDir.appendingPathComponent("secret.mjs"), atomically: true, encoding: .utf8)
+    try? "export default \"TRUSTED OK\";".write(
+        to: trusted.appendingPathComponent("bundle.mjs"), atomically: true, encoding: .utf8)
     defer { try? fm.removeItem(at: baseDir) }
 
     if let engine = makeEngine() {
         engine.withMachine { _ in
             xsBridgeAddModuleRoot("", root.path)
             xsBridgeAddModuleRoot("lib", lib.path)
+            xsBridgeAddTrustedModulePrefix(trusted.path)   // framework bundle dir
         }
-        // An absolute path OUTSIDE the roots still resolves (the bundle-import
-        // case: framework engines share the process-wide roots but load their
-        // own resources by absolute path) — confinement governs bare/relative.
+        // An arbitrary absolute path (outside every root/prefix) is BLOCKED —
+        // an agent can't escape via `/abs`. An absolute path inside a trusted
+        // prefix RESOLVES — the framework's bundle-import case.
         let absSecret = baseDir.appendingPathComponent("secret.mjs").path
+        let absTrusted = trusted.appendingPathComponent("bundle.mjs").path
         _ = try? engine.eval("""
             globalThis.__r = {};
             Promise.all([
@@ -511,8 +519,11 @@ do {
                     .then(function (m) { __r.escape = "LOADED:" + m.default; })
                     .catch(function () { __r.escape = "blocked"; }),
                 import("\(absSecret)")
-                    .then(function (m) { __r.abs = m.default; })
+                    .then(function (m) { __r.abs = "LEAKED:" + m.default; })
                     .catch(function () { __r.abs = "blocked"; }),
+                import("\(absTrusted)")
+                    .then(function (m) { __r.trusted = m.default; })
+                    .catch(function () { __r.trusted = "blocked"; }),
             ]).catch(function () {});
             """)
         engine.runUntilIdle(timeout: 5)
@@ -521,8 +532,12 @@ do {
         check("bare subdir resolves", got.contains("\"subdir\":7"))
         check("named root prefix resolves", got.contains("\"named\":\"lib tool\""))
         check("`..` escape is confined (blocked)", got.contains("\"escape\":\"blocked\""))
-        check("absolute path resolves despite roots (bundle case)", got.contains("\"abs\":\"LEAKED\""))
-        engine.withMachine { _ in xsBridgeClearModuleRoots() }
+        check("arbitrary absolute path is blocked", got.contains("\"abs\":\"blocked\""))
+        check("trusted-prefix absolute path resolves", got.contains("\"trusted\":\"TRUSTED OK\""))
+        engine.withMachine { _ in
+            xsBridgeClearModuleRoots()
+            xsBridgeClearTrustedModulePrefixes()
+        }
     } else {
         check("create engine", false)
     }
