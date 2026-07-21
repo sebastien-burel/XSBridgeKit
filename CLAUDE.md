@@ -191,9 +191,13 @@ consumer can register **roots** (`xsBridgeAddModuleRoot(prefix, dir)`, process-w
 prefix is a default root for **bare** specifiers (`import "util"` → `<root>/util.{xsb,mjs,js}`,
 searched in that order), a named prefix maps `<prefix>/x` to an external directory
 (`import "modules/x"`). While any root is registered the loader is **confined** — every
-resolution, relative ones included, must land inside a root (no `../` escape) — mirroring
-Moddable's `mcconfig` layout. With no root registered the loader keeps its plain realpath
-behaviour, so this is opt-in. (`.xsa` archive roots are a planned follow-up.)
+bare/relative resolution (relative ones included) must land inside a root (no `../` escape) —
+mirroring Moddable's `mcconfig` layout. An **absolute-path** specifier is exempt: it always
+realpaths as-is, because the roots are process-wide and framework engines (a JS provider,
+tool bundle) import their own bundle resources by absolute path — confining those would break
+them mid-run; confinement targets the agent's bare/relative imports. With no root registered
+the loader keeps its plain realpath behaviour, so this is opt-in. (`.xsa` archive roots are a
+planned follow-up.)
 
 ## Critical invariants (must always hold)
 

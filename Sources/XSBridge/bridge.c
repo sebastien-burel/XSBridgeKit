@@ -210,6 +210,18 @@ txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
         return XS_NO_ID;
     }
 
+    if (name[0] == mxSeparator) {
+        /* An absolute path is an explicit, fully-qualified specifier — e.g. a
+         * bundle resource imported by the framework's own (non-agent) engines,
+         * which share this process-wide root registry. Realpath it as-is,
+         * independent of any roots: roots + confinement govern bare and relative
+         * specifiers only (a `/abs/path` is not a bare name to resolve, and
+         * confining it would break every bundle import while an agent runs). */
+        if (c_realpath(name, real))
+            return fxNewNameC(the, real);
+        return XS_NO_ID;
+    }
+
     if (gModuleRoots) {
         /* Bare specifier — resolve against a named or default root, then
          * confine (a `../` in the remainder can't escape the root set). */
