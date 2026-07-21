@@ -494,8 +494,13 @@ do {
         to: lib.appendingPathComponent("tool.mjs"), atomically: true, encoding: .utf8)
     try? "export default \"LEAKED\";".write(
         to: baseDir.appendingPathComponent("secret.mjs"), atomically: true, encoding: .utf8)
-    try? "export default \"TRUSTED OK\";".write(
+    // bundle.mjs re-exports via a RELATIVE import of a sibling — the provider's
+    // real pattern (its modules import each other by `./x`), which must resolve
+    // inside a trusted prefix even while an agent's roots confine the loader.
+    try? "import v from \"./helper.mjs\"; export default v;".write(
         to: trusted.appendingPathComponent("bundle.mjs"), atomically: true, encoding: .utf8)
+    try? "export default \"TRUSTED OK\";".write(
+        to: trusted.appendingPathComponent("helper.mjs"), atomically: true, encoding: .utf8)
     defer { try? fm.removeItem(at: baseDir) }
 
     if let engine = makeEngine() {

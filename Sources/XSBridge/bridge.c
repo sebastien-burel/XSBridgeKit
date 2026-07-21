@@ -140,7 +140,12 @@ static int fxPathInside(const char* path, const char* dir)
     return path[n] == 0 || path[n] == mxSeparator;
 }
 
-/* Confinement: with roots configured, a resolved path must sit inside one. */
+static int fxPathTrusted(const char* real);   /* defined with the trusted-prefix registry below */
+
+/* Confinement: with roots configured, a resolved path must sit inside a root or
+ * a trusted framework prefix. Applies to bare, relative AND absolute specifiers
+ * (the provider's own modules import each other by relative path inside the
+ * bundle, so relative resolutions must accept trusted prefixes too). */
 static int fxModuleAllowed(const char* real)
 {
     if (!gModuleRoots)
@@ -148,7 +153,7 @@ static int fxModuleAllowed(const char* real)
     for (ModuleRoot* r = gModuleRoots; r; r = r->next)
         if (fxPathInside(real, r->dir))
             return 1;
-    return 0;
+    return fxPathTrusted(real);
 }
 
 /* Trusted absolute-path prefixes — directories the framework itself loads
@@ -269,7 +274,7 @@ txID fxFindModule(txMachine* the, txSlot* realm, txID moduleID, txSlot* slot)
          * yet still confines the agent (a `/etc/...` absolute escape resolves to
          * neither, so it is rejected). With no roots registered fxModuleAllowed
          * is permissive, preserving the plain realpath back-compat. */
-        if (c_realpath(name, real) && (fxModuleAllowed(real) || fxPathTrusted(real)))
+        if (c_realpath(name, real) && fxModuleAllowed(real))
             return fxNewNameC(the, real);
         return XS_NO_ID;
     }
