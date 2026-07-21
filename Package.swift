@@ -14,6 +14,11 @@ let xsDefines: [CSetting] = [
   // values) and chunk layout is deterministic — required by fxWriteSnapshot.
   // ABI-affecting (txChunk layout), so it MUST be identical across all C targets.
   .define("mxSnapshot", to: "1"),
+  // Silence XS's own stdout traces (caught-exception / error / warning reports,
+  // e.g. "path:line: exception: …!"): a library must not pollute the consumer's
+  // stdout, and real errors already surface to Swift as clean error results
+  // (invariant #1). Guards console `c_printf` blocks only — NOT ABI-affecting.
+  .define("mxNoConsole", to: "1"),
 ]
 
 // Header search paths are relative to each target's directory, so consumer C
