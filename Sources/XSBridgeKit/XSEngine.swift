@@ -40,6 +40,10 @@ private final class RunLoopThread {
       finished.signal()   // CFRunLoopRun returned -> thread is exiting
     }
     t.stackSize = 4 << 20
+    // Match the QoS of the (typically UI) callers that block on `sync`: without
+    // this the thread runs at .default and a .userInteractive caller waiting on
+    // it is a priority inversion (flagged by the Thread Performance Checker).
+    t.qualityOfService = .userInitiated
     t.start()
     started.wait()
     thread = t
