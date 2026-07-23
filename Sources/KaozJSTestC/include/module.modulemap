@@ -1,0 +1,4 @@
+module KaozJSTestC {
+    header "demoHost.h"
+    export *
+}

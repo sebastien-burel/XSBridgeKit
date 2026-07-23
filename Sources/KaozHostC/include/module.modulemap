@@ -1,0 +1,6 @@
+module KaozHostC {
+    header "tykaozHost.h"
+    header "httpHost.h"
+    header "jsProviderHost.h"
+    export *
+}
