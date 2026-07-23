@@ -1,0 +1,4 @@
+module KaozJSCore {
+    header "bridge.h"
+    export *
+}

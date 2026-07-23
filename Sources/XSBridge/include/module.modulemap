@@ -1,4 +1,0 @@
-module XSBridge {
-    header "bridge.h"
-    export *
-}

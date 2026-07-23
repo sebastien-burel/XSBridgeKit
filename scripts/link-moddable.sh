@@ -6,7 +6,7 @@
 # exact curated subset it compiles from a local Moddable checkout, found via
 # the $MODDABLE environment variable. Run this once after cloning (and again
 # if you move your Moddable checkout). The created links live under
-# Sources/XSBridge/xs/ and are git-ignored. A recent Moddable master is expected.
+# Sources/KaozJSCore/xs/ and are git-ignored. A recent Moddable master is expected.
 #
 # Usage:
 #   export MODDABLE=/path/to/moddable
@@ -20,7 +20,7 @@ SRC="$MODDABLE/xs"
 
 # Resolve the package root from this script's location.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-XS="$ROOT/Sources/XSBridge/xs"
+XS="$ROOT/Sources/KaozJSCore/xs"
 
 echo "Linking XS sources from: $SRC"
 rm -rf "$XS"

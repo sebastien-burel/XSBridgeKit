@@ -1,4 +1,0 @@
-module XSBridgeTestC {
-    header "demoHost.h"
-    export *
-}
