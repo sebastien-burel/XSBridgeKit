@@ -1,17 +1,22 @@
-XSBridgeKit — third-party notices
-==================================
+KaozKit — third-party notices
+==============================
 
 1. Original project code — MIT License (see LICENSE)
 ---------------------------------------------------
 Copyright (c) 2026 Sébastien Burel.
 
 Everything tracked in this repository is original work, licensed under the MIT
-License — the bridge shim, the Swift API, the test harness and the build setup:
+License — the engine bridge, the agent runtime, the Swift API, the test harness
+and the build setup:
 
-    Sources/XSBridge/bridge.c
-    Sources/XSBridge/include/
-    Sources/XSBridgeKit/
-    Sources/xsBridgeTest/
+    Sources/KaozJSCore/bridge.c
+    Sources/KaozJSCore/include/
+    Sources/KaozJS/
+    Sources/KaozHostC/
+    Sources/KaozKit/
+    Sources/KaozMLX/
+    Sources/kaoz/
+    Sources/KaozJSTest*/
     agents/
     scripts/
 
@@ -20,8 +25,8 @@ License — the bridge shim, the Swift API, the test harness and the build setup
 This package compiles the XS JavaScript engine from the Moddable SDK, but does
 **not** redistribute any Moddable source. The sources are linked at build time
 from a local Moddable checkout you provide (via $MODDABLE and
-scripts/link-moddable.sh — see README); the links under Sources/XSBridge/xs/ are
-git-ignored and never committed.
+scripts/link-moddable.sh — see README); the links under Sources/KaozJSCore/xs/
+are git-ignored and never committed.
 
     Project : Moddable SDK
     Source  : https://github.com/Moddable-OpenSource/moddable

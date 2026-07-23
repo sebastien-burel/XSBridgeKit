@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 #
-# link-mlx-metallib.sh — make `swift run TyKaozCli … --provider mlx` work.
+# link-mlx-metallib.sh — make `swift run kaoz … --provider mlx` work.
 #
 # mlx-swift compiles its Metal shader library (default.metallib, inside
 # mlx-swift_Cmlx.bundle) only in an Xcode build — not in a plain `swift build`.
 # A SwiftPM command-line executable therefore fails at runtime with
 # "Failed to load the default metallib". MLX searches for the library colocated
 # with the binary and in the `mlx-swift_Cmlx` bundle, so this copies the bundle
-# produced by the app's Xcode build next to TyKaozCli's build products.
+# produced by the app's Xcode build next to kaoz's build products.
 #
-# Run once after each `swift build` (of TyKaozCli). Requires the TyKaoz app to
+# Run once after each `swift build` (of kaoz). Requires the TyKaoz app to
 # have been built in Xcode at least once (that build produces the metallib).
 #
 set -euo pipefail
 
-pkg_dir="$(cd "$(dirname "$0")/.." && pwd)"     # TyKaozKit/
+pkg_dir="$(cd "$(dirname "$0")/.." && pwd)"     # KaozKit/
 bundle="mlx-swift_Cmlx.bundle"
 metallib_rel="Contents/Resources/default.metallib"
 
@@ -56,4 +56,4 @@ if [ "$linked" -eq 0 ]; then
     exit 1
 fi
 
-echo "done — TyKaozCli can now run --provider mlx."
+echo "done — kaoz can now run --provider mlx."

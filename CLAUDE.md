@@ -4,35 +4,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A reusable Swift library (**`XSBridgeKit`**) that embeds the **XS (Moddable)** JavaScript
+A single Swift package, **`KaozKit`**, in two layers. At the bottom is a reusable JS↔Swift
+engine bridge (**`KaozJSCore`** + **`KaozJS`**) that embeds the **XS (Moddable)** JavaScript
 engine and lets JS call back into **Swift** — synchronously, asynchronously, and as a
 **stream** of tokens — on macOS, without memory corruption or crashes. The central
-guarantee it upholds:
+guarantee the engine upholds:
 
 > A JS `await host.echo(...)` is resolved by Swift work running on another queue, with the
 > JS continuation correctly resuming, stably and repeatably.
 
-It grew out of a validated proof of concept covering lifecycle, async, streaming,
-concurrency and GC-under-stress; the `xsBridgeTest` harness keeps that coverage as the
-regression suite.
+On top of that engine is an **autonomous-agent runtime** (**`KaozKit`**): an agent is a JS
+module (`export function run(input)`) that drives an LLM, calls tools, and reads/writes
+memory through a `host.*` surface. A project embedding **only JavaScript** depends on
+`KaozJS`; an **agent** project depends on `KaozKit`, which pulls the engine in.
 
-Target: **macOS, Apple Silicon (M3 Pro)**, Swift toolchain. The library has no UI; the
-`xsBridgeTest` executable is a CLI harness that doubles as the regression suite.
+The engine grew out of a validated proof of concept covering lifecycle, async, streaming,
+concurrency and GC-under-stress; the `KaozJSTests` harness keeps that coverage as the
+engine regression suite. This package was formed by merging the former XSBridge/XSBridgeKit
+socle and the TyKaozKit agent library (commit `970292e`); internal C symbols (`struct
+XSBridge`, the `xsBridge*`/`xsService*` API, the snapshot signature) were left unchanged, so
+existing snapshots stay compatible — which is why the C code and several Swift symbols still
+carry `xsBridge*` / `TyKaoz*` names.
 
-## How it works
+Target: **macOS 26+, Apple Silicon**, Swift toolchain. The library has no UI; `kaoz` is a
+headless agent CLI / resident daemon, and `KaozJSTests` is a CLI harness that doubles as the
+engine regression suite.
+
+## Layered products
+
+```
+KaozJSCore (C)  — XS engine + the xsService* async-settle bridge
+KaozJS          — Swift XSEngine (dedicated thread + CFRunLoop, snapshot, module roots)
+KaozHostC (C)   — the agent's XS host functions (host.llm/tool/memory/schedule)
+KaozKit         — agent runtime: providers, tools, memory, channels, persona
+KaozMLX         — MLX local-inference providers (heavy deps, opt-in)
+kaoz            — headless CLI / resident daemon
+```
+
+The rest of this file documents the engine layer first (unchanged internals, renamed
+targets), then the agent layer built on top.
+
+## How it works (engine layer: KaozJSCore + KaozJS)
 
 **Consumer C host functions.** The C layer hardcodes no host capabilities and installs
-nothing — even `print` is consumer-supplied (the demo host and the CLI each install
+nothing — even `print` is consumer-supplied (the demo host and each consumer install
 their own). A consumer supplies its own small C target (compiled with the **same XS
-defines** as `XSBridge` — the `txMachine` ABI depends on them) whose install function
+defines** as `KaozJSCore` — the `txMachine` ABI depends on them) whose install function
 (`xsNewHostFunction` + `xsSet`, run via `XSEngine.withMachine`) registers each native
 capability directly. Each C host function marshals its arguments to plain C values, and —
 for async calls — creates its Promise via `xsServicePromise` (declared in `bridgeXS.h`),
 then hands `(bridge, id, params)` to its Swift `@_cdecl` counterpart; Swift settles later
 with `xsServiceResolve` / `xsServiceReject` / `xsServiceEmit`. There is no JS prelude, no string-keyed
-dispatch, no Swift protocol: the pair `xsBridgeTestC/demoHost.c` + `DemoHost.swift`
+dispatch, no Swift protocol: the pair `KaozJSTestC/demoHost.c` + `DemoHost.swift`
 (echo/stream/fail/add, plus a multi-machine service call) is the reference pattern, kept
-as the regression suite.
+as the engine regression suite. `KaozHostC/tykaozHost.c` + `TyKaozHost.swift` is the real
+consumer — the agent's `host.*` surface built on the very same pattern.
 
 **Dedicated-thread runtime.** Each `XSEngine` owns a private background `Thread` with its
 own `CFRunLoop` (`RunLoopThread`). The machine is created on it; every machine access is
@@ -40,12 +66,11 @@ marshalled there via `loop.sync`; async completions wake the same run loop. The 
 is never touched from the caller's (e.g. UI) thread — preserving the single-threaded XS
 invariant.
 
-**Library split.** The reusable Swift API lives in its own `XSBridgeKit` library target
-(`Sources/XSBridgeKit/XSEngine.swift`), exported via
-`products: [.library(name: "XSBridgeKit", …)]` and depending on the C `XSBridge` target.
-Consumers `import XSBridgeKit` (plus `XSBridge` for the flat settle functions).
-`xsBridgeTest` (harness + `DemoHost`) depends on `XSBridgeKit` + `XSBridge` +
-`xsBridgeTestC`. Public API: `XSEngine`, `XSError`.
+**Library split.** The reusable Swift engine API lives in its own `KaozJS` library target
+(`Sources/KaozJS/XSEngine.swift`), exported via `products: [.library(name: "KaozJS", …)]`
+and depending on the C `KaozJSCore` target. Consumers `import KaozJS` (plus `KaozJSCore`
+for the flat settle functions). `KaozJSTests` (harness + `DemoHost`) depends on `KaozJS` +
+`KaozJSCore` + `KaozJSTestC`. Public engine API: `XSEngine`, `XSCreation`, `XSError`.
 
 **Snapshot (persist / restore the JS heap).** `engine.writeSnapshot() -> Data` serializes
 the whole machine (`fxWriteSnapshot`); `XSEngine(snapshot:)` restores it in a fresh process
@@ -79,7 +104,7 @@ the in-flight `ServiceMessage` records (`{id → (resolve,reject)}`), remember/f
 module status, and `swiftContext` (the unretained `XSEngine` pointer, set via
 `xsBridgeSetContext`, recoverable from consumer `@_cdecl` functions via
 `xsBridgeGetContext`). The `print` capture asserted by the harness lives in
-`xsBridgeTestC` (`xsBridgeTestOutputCount/At`), not in the bridge.
+`KaozJSTestC` (`xsBridgeTestOutputCount/At`), not in the bridge.
 
 Async flow: JS `host.echo(x)` enters the consumer's C host function, which stringifies the
 argument, calls `xsServicePromise` — creates the Promise **in C** (`fxNewPromiseCapability`),
@@ -117,9 +142,9 @@ flow). The machine is created with `xsCreateMachine` (full engine **with parser*
 `xst`), not via `fxCloneMachine`.
 
 ```
-Package.swift             # XS compile flags (from the xst mac makefile), shared by all C targets
+Package.swift             # XS compile flags + product/target graph; xsDefines shared by all C targets
 Sources/
-  XSBridge/               # C target: XS sources + mac platform + the bridge shim
+  KaozJSCore/             # C target: XS sources + mac platform + the bridge shim
     include/module.modulemap   # exposes bridge.h to Swift
     include/bridge.h           # flat C API, NO XS macros leak across it
     include/bridgeXS.h         # XS-typed helpers (xsServicePromise) — textual include for C targets, never Swift
@@ -128,21 +153,39 @@ Sources/
     settle.c                   # shared async-call core: xsServicePromise + message list + the ServiceEvent settle callbacks (peer-neutral)
     bridge.c                   # machine lifecycle, module loader, snapshot, and the NATIVE (Swift) peer (JSON posters) — depends on settle.c
     service.c                  # the MACHINE↔MACHINE peer (alien-marshalled) + JS-initiated Thread/Service spawn — depends on settle.c
-  XSBridgeKit/            # Swift library (public reusable API; consumers import this)
+  KaozJS/                 # Swift engine library (public reusable API; consumers import this)
     XSEngine.swift             # Swift wrapper; dedicated thread + CFRunLoop per machine (RunLoopThread)
-  xsBridgeTestC/          # C side of the demo host (consumer host-function pattern)
+  KaozHostC/              # C host functions for the agent (consumer of the engine)
+    tykaozHost.c               # host.log/__chat/tool.*/memory.*/schedule/every/cancel/usage — xsServicePromise + @_cdecl into Swift
+    httpHost.c                 # the native __http(request,onChunk) primitive (backs the JS providers + XHR shim)
+    jsProviderHost.c           # __emit/__done/__providerError channel for a JSProvider engine
+  KaozKit/                # Swift agent runtime (the flagship product; import KaozKit)
+    Agents/                    # AgentRuntime (one-shot), AgentHost (resident+snapshot), TyKaozHost (host.* backing),
+                               #   TyKaozThreads (sub-agent factory), AgentModuleStaging, ModuleResolver, JSToolBundle
+    Providers/                 # LLMProvider + families: Anthropic/Google/Ollama/OpenAI/OpenAICompatible
+                               #   (DeepSeek/Mistral/Qwen/ZAI/LocalOpenAI)/Apple/ComfyUI/Embedding/JS
+    Tools/                     # Tool + ToolRegistry; read (ReadFile/ListDirectory/GrepFiles/CurrentLocation),
+                               #   Actuation/ (Write/Edit/Shell/HTTPRequest), Email/, FileSpaces/, Memory/, Plugins/
+    Channels/WebhookServer.swift  # inbound HTTP → resident agent delivery
+    Support/                   # MemoryStoring, Subprocess
+    Resources/js/              # JS loaded at runtime via Bundle.module: agent-orchestrator.js, provider-orchestrator.js,
+                               #   {anthropic,google,ollama,openai}.js, xmlhttprequest.js, tools/{datetime,fetch-url,web-search,http}.js
+  KaozMLX/                # Swift, opt-in: MLX local inference (MLXLLMProvider/MLXEmbeddingProvider + Models/ store & catalog)
+  kaoz/                   # Swift executable: headless agent CLI / resident daemon (main.swift, CLIMemoryStore.swift)
+  KaozJSTestC/            # C side of the engine demo host (consumer host-function pattern)
     demoHost.c                 # print (+capture) + host.echo/stream/fail/add — xsServicePromise + @_cdecl calls into Swift
-  xsBridgeTest/           # Swift executable: runner + test harness
+  KaozJSTests/            # Swift executable: engine regression harness
     DemoHost.swift             # Swift side of the demo host: @_cdecl entry points (regression suite)
     main.swift                 # runs the test agents, asserts, exits non-zero on any failure
-agents/                   # JS test scripts: echo.js, stream.js, concurrent.js, error.js, sequential.js
-scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE into Sources/XSBridge/xs/
+agents/                   # engine JS fixtures: echo.js, stream.js, concurrent.js, error.js, sequential.js, modules/
+scripts/link-moddable.sh  # links the curated XS source subset from $MODDABLE into Sources/KaozJSCore/xs/
+scripts/link-mlx-metallib.sh  # copies MLX's default.metallib next to the CLI build so `kaoz --provider mlx` works
 ```
 
 The XS sources are **not vendored**: `scripts/link-moddable.sh` symlinks the exact
 curated subset (`xs/sources`, `xs/includes`, the platform dispatch headers
 `xsPlatform.h`/`xsHost.h`, and the macOS port `mac_xs.h`+`mac_xs.c`) from `$MODDABLE/xs`
-into `Sources/XSBridge/xs/`. Those links are git-ignored. SwiftPM compiles `.c` through the
+into `Sources/KaozJSCore/xs/`. Those links are git-ignored. SwiftPM compiles `.c` through the
 directory symlinks; only `sources/` and `platforms/mac_xs.c` carry compiled units, which is
 why `platforms/` is linked file-by-file (its other `.c` — every other platform port — must
 not be compiled). `fdlibm` is not linked: the macOS port uses the system `libm`
@@ -201,6 +244,60 @@ survive, while an agent's arbitrary `/abs/path` escape (in neither a root nor a 
 is still rejected. With no root registered the loader keeps its plain realpath behaviour, so
 this is opt-in. (`.xsa` archive roots are a planned follow-up.)
 
+## The agent layer (KaozKit)
+
+The agent runtime is a **consumer of the engine**, wired through exactly the mechanisms
+above — it adds no new engine concepts. An agent is a JS module that `export`s `run(input)`
+(one-shot) or `{ onMessage, onEvent, onTick }` (resident); its return value comes back to
+Swift as JSON via `host.__report` / `host.__deliverResult`.
+
+**Host surface.** `KaozHostC/tykaozHost.c` installs the `host.*` object (the reference
+host-function pattern, `xsServicePromise` + `@_cdecl` into `TyKaozHost.swift`): `host.log`,
+`host.__chat` (async LLM turn, streams tokens via `xsServiceEmit`), `host.tool.list`/`call`,
+`host.memory.save`/`read`/`list`/`search`, `host.schedule`/`every`/`cancel` (self-scheduled
+ticks), `host.usage`. `TyKaozHost.swift` holds the `@_cdecl` entry points; each recovers the
+host from the bridge context and settles via `HostReply` (`xsServiceResolve`/`Reject`/`Emit`).
+The ergonomic wrappers — `host.llm.chat`, `host.provider(id)`, `__runAgent`, `__deliver`,
+`__callTool` — are a **JS shim** (`Resources/js/agent-orchestrator.js`, imported as a bundled
+ES module by `XSEngine.tyKaoz(host:)`). Bundled JS is loaded by absolute path, so its
+directory is registered as a **trusted module prefix** (`JSResource.registerTrustedPrefix`).
+
+**Entry points (Swift).** `AgentRuntime` (`Agents/AgentRuntime.swift`) runs one agent on a
+fresh engine and tears it down (`run` / `runRooted` / `runRootedSource` → JSON `String`).
+`AgentHost` (`Agents/AgentHost.swift`) keeps one engine alive across many
+`deliver(kind:payload:)` calls — the JS heap persists, `host.schedule` timers deliver ticks,
+and `writeSnapshot()` / `init(snapshot:)` persist and restore the whole heap across
+processes (snapshot mode needs `installThreads: false`, since the `Thread`/`Service` globals
+reference host callbacks not in the frozen table). Both are constructed with a `makeProvider`
+(run default), an optional `resolveProvider(id, options)` (JS-selected provider, secrets
+injected in Swift), a `ProviderDescriptor` catalog, a `ToolRegistry`, a `MemoryStoring`, and
+optional `tokenBudget` / `persona`. Sub-agents use the engine's `Thread`/`Service` spawn: the
+factory registered via `TyKaozThreads.register` builds a child `TyKaozHost` with the same
+wiring.
+
+**Providers.** All conform to `LLMProvider` (streaming `chat(messages:tools:)` →
+`StreamEvent`). `TyKaozHost.chat` runs the **tool-call loop** (provider → tool → provider, up
+to `maxToolRounds`) off the XS thread on a `@MainActor` task, streaming text back via
+`reply.emit` and settling with the final text. Native providers are pure Swift; **JS
+providers** (`JSProvider` + `Resources/js/*.js`) run their HTTP/SSE in a JS engine over the
+native `__http` primitive (`httpHost.c`) with an `XMLHttpRequest` shim, bridging events to
+Swift through `jsProviderHost.c` (`__emit`/`__done`/`__providerError`). `KaozMLX` adds
+on-device MLX providers behind its own product so plain `KaozKit` consumers don't pull the
+heavy deps.
+
+**Tools & memory.** `Tool` + `ToolRegistry`. Read tools (`ReadFile`/`ListDirectory`/
+`GrepFiles`) are confined to `AuthorizedRoot`s; actuation (`WriteFile`/`EditFile`/`Shell`/
+`HTTPRequest`) is opt-in and separately confined; `EmailTools` speak IMAP/SMTP; `HTTPPluginTool`
+builds tools from a declarative `PluginManifest`. `SemanticMemoryStore` ranks notes by
+embedding similarity behind `MemoryStoring`/`MemoryRetrieving`. `WebhookServer` delivers
+inbound HTTP bodies to a resident agent.
+
+**CLI (`kaoz`).** `Sources/kaoz/main.swift` is the canonical worked example: it maps
+`--provider`/env secrets to concrete providers via `resolveProvider`, assembles the tool set
+from opt-in flags (`--root`/`--allow-write`/`--allow-shell`/`--allow-http`/`--email`), and
+runs `AgentRuntime.runRooted` (or an `AgentHost` for `--resident`/`--daemon`/`--webhook`,
+with `--state` snapshotting the heap).
+
 ## Critical invariants (must always hold)
 
 1. **No XS exception crosses a Swift frame.** All `xsTry`/`xsCatch` stays in C; every
@@ -214,21 +311,34 @@ this is opt-in. (`.xsa` archive roots are a planned follow-up.)
    `xsForget`'d exactly once at settle. Verify no leak (id table empty, remember/forget
    counters balanced at the end of each run).
 
+Agent-layer invariants (built on the four above):
+
+5. **Secrets never reach JS.** API keys and credentials live in Swift (env → `resolveProvider`
+   / tool config). JS names a provider by id and passes non-secret options (`model`, `baseURL`);
+   the Swift resolver injects the key.
+6. **Actuation is opt-in and confined.** Write/shell/http/email tools are added only when the
+   consumer grants them, each confined to its authorized roots/hosts; read tools are confined
+   to `AuthorizedRoot`s. An agent's module resolution is confined to its roots (bundle JS aside,
+   marked as a trusted prefix).
+
 ## Build & run
 
 Requires a local Moddable checkout (recent master); link it once before building:
 
 ```bash
 export MODDABLE=/path/to/moddable
-./scripts/link-moddable.sh          # symlinks the XS sources into Sources/XSBridge/xs/
-swift build -c release              # builds in release on Apple Silicon
-swift run xsBridgeTest              # runs the harness; exits non-zero if any criterion fails
+./scripts/link-moddable.sh          # symlinks the XS sources into Sources/KaozJSCore/xs/
+swift build -c release              # builds in release on Apple Silicon (macOS 26+)
+swift run -c release KaozJSTests    # engine regression harness; non-zero exit on any failure
+swift run -c release kaoz agent.js --provider anthropic --input '{"question":"…"}'
 ```
 
-`main.swift` runs each agent, asserts its criterion, and exits non-zero on failure —
-designed for CI and non-interactive Claude Code runs. There is no separate test framework;
-the harness *is* the test suite. To exercise a single behaviour, run the corresponding
-agent in `agents/` from the harness.
+`KaozJSTests/main.swift` runs each engine fixture, asserts its criterion, and exits non-zero
+on failure — designed for CI and non-interactive Claude Code runs. There is no separate test
+framework; the harness *is* the engine test suite. To exercise a single behaviour, run the
+corresponding fixture in `agents/` from the harness. `kaoz` runs a real agent (secrets from
+the environment). For `kaoz --provider mlx`, run `scripts/link-mlx-metallib.sh` once after
+building (the Metal library isn't produced by a plain `swift build`).
 
 The C target is based on the macOS port: `XSPLATFORM="mac_xs.h"` and `platforms/mac_xs.c`
 is compiled. The remaining `#define`s in `Package.swift` (`mxDebug`,
